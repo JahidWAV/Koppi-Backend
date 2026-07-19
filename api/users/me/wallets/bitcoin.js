@@ -1,4 +1,8 @@
-import { privy, getBearerToken } from '../../../../lib/privy.js';
+import {
+  privy,
+  getBearerToken,
+  verifyPrivyAccessToken
+} from '../../../../lib/privy.js';
 
 console.log('[bitcoin] module loaded');
 
@@ -34,24 +38,12 @@ async function verifyAccessToken(req) {
     tokenLength: token.length
   });
 
-  const authUtils = privy?.utils?.();
-  logStep('verifyAccessToken:privy_utils_ready', {
-    hasUtils: !!authUtils,
-    hasAuth: !!authUtils?.auth
-  });
-
-  const authClient = authUtils?.auth?.();
-  logStep('verifyAccessToken:auth_client_ready', {
-    hasAuthClient: !!authClient,
-    hasVerifyAccessToken: typeof authClient?.verifyAccessToken === 'function'
-  });
-
-  const claims = await authClient.verifyAccessToken({
-    access_token: token
-  });
+  const claims = await verifyPrivyAccessToken(token);
 
   logStep('verifyAccessToken:success', {
-    userId: claims?.userId ?? null
+    userId: claims?.userId ?? null,
+    appId: claims?.appId ?? null,
+    issuer: claims?.issuer ?? null
   });
 
   return {
