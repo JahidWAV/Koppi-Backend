@@ -1,0 +1,195 @@
+// api/users/me/balances.ts
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+
+const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
+const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
+const PRIVY_BASE_URL = 'https://api.privy.io';
+
+type BalanceAsset = {
+  symbol: string;
+  amount: string;
+  value?: string;
+  currency?: string;
+  price?: {
+    value: string;
+    currency: string;
+  };
+};
+
+type PrivyBalanceResponse = {
+  total?: {
+    value: string;
+    currency: string;
+  };
+  assets?: BalanceAsset[];
+};
+
+type WalletDescriptor = {
+  id?: string;
+  chain_type?: string;
+  address?: string;
+  wallet_client_type?: string;
+  connector_type?: string;
+  delegated?: boolean;
+};
+
+type PrivyAccountResponse = {
+  id: string;
+  wallets?: WalletDescriptor[];
+};
+
+function basicAuthHeader(appId: string, appSecret: string) {
+  const token = Buffer.from(`${appId}:${appSecret}`).toString('base64');
+  return `Basic ${token}`;
+}
+
+async function getUserFromKoppiAPI(userAccessToken: string) {
+  const response = await fetch('https://api.koppi.app/api/users/me/debug-token', {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${userAccessToken}`,
+    },
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  return response.json();
+}
+
+async function getPrivyAccount(accountId: string) {
+  if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
+    throw new Error('Missing Privy credentials');
+  }
+
+  const response = await fetch(`${PRIVY_BASE_URL}/v1/accounts/${accountId}`, {
+    method: 'GET',
+    headers: {
+      Authorization: basicAuthHeader(PRIVY_APP_ID, PRIVY_APP_SECRET),
+      'privy-app-id': PRIVY_APP_ID,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Privy account request failed: ${response.status}`);
+  }
+
+  return response.json() as Promise<PrivyAccountResponse>;
+}
+
+async function getPrivyAccountBalance(accountId: string) {
+  if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
+    throw new Error('Missing Privy credentials');
+  }
+
+  const response = await fetch(`${PRIVY_BASE_URL}/v1/accounts/${accountId}/balance`, {
+    method: 'GET',
+    headers: {
+      Authorization: basicAuthHeader(PRIVY_APP_ID, PRIVY_APP_SECRET),
+      'privy-app-id': PRIVY_APP_ID,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Privy balance request failed: ${response.status}`);
+  }
+
+  return response.json() as Promise<PrivyBalanceResponse>;
+}
+
+function asNumber(value?: string) {
+  const n = Number(value ?? '0');
+  return Number.isFinite(n) ? n : 0;
+}
+
+function pickAsset(assets: BalanceAsset[], symbol: string) {
+  return assets.find((asset) => asset.symbol.toUpperCase() === symbol.toUpperCase()) ?? null;
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Missing bearer token' });
+    }
+
+    const koppiUser = await getUserFromKoppiAPI(token);
+
+    if (!koppiUser) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const accountId =
+      koppiUser?.accountId ||
+      koppiUser?.account_id ||
+      koppiUser?.privyAccountId ||
+      koppiUser?.privy_account_id;
+
+    if (!accountId) {
+      return res.status(400).json({ error: 'No Privy account id found for user' });
+    }
+
+    const [account, balance] = await Promise.all([
+      getPrivyAccount(accountId),
+      getPrivyAccountBalance(accountId),
+    ]);
+
+    const assets = balance.assets ?? [];
+
+    const eth = pickAsset(assets, 'ETH');
+    const sol = pickAsset(assets, 'SOL');
+    const pol = pickAsset(assets, 'POL');
+    const btc = pickAsset(assets, 'BTC');
+
+    return res.status(200).json({
+      accountId: account.id,
+      totalUsd: balance.total?.value ?? '0',
+      wallets: account.wallets ?? [],
+      balances: {
+        ethereum: {
+          symbol: 'ETH',
+          amount: eth?.amount ?? '0',
+          fiatValue: eth?.value ?? '0',
+          note: 'Privy account balance is aggregated across supported wallets/chains.',
+        },
+        base: {
+          symbol: 'ETH',
+          amount: eth?.amount ?? '0',
+          fiatValue: eth?.value ?? '0',
+          note: 'Needs wallet/network-specific enrichment if you want Base isolated.',
+        },
+        arbitrum: {
+          symbol: 'ETH',
+          amount: eth?.amount ?? '0',
+          fiatValue: eth?.value ?? '0',
+          note: 'Needs wallet/network-specific enrichment if you want Arbitrum isolated.',
+        },
+        polygon: {
+          symbol: 'POL',
+          amount: pol?.amount ?? '0',
+          fiatValue: pol?.value ?? '0',
+        },
+        solana: {
+          symbol: 'SOL',
+          amount: sol?.amount ?? '0',
+          fiatValue: sol?.value ?? '0',
+        },
+        bitcoin: {
+          symbol: 'BTC',
+          amount: btc?.amount ?? '0',
+          fiatValue: btc?.value ?? '0',
+        },
+      },
+    });
+  } catch (error) {
+    console.error('balances route error', error);
+    return res.status(500).json({ error: 'Failed to fetch balances' });
+  }
+}
