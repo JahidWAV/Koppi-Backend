@@ -1,8 +1,8 @@
 import {
-  privy,
   getBearerToken,
   verifyPrivyAccessToken
 } from '../../../../lib/privy.js';
+import { env } from '../../../../lib/env.js';
 
 console.log('[bitcoin] module loaded');
 
@@ -22,6 +22,11 @@ function safeSerializeError(error) {
 
 function logStep(step, extra = {}) {
   console.log(`[bitcoin] ${step}`, JSON.stringify(extra));
+}
+
+function getPrivyBasicAuthHeader() {
+  const credentials = Buffer.from(`${env.appId}:${env.appSecret}`).toString('base64');
+  return `Basic ${credentials}`;
 }
 
 async function verifyAccessToken(req) {
@@ -58,37 +63,48 @@ async function verifyAccessToken(req) {
 async function createSegwitWallet(userId) {
   logStep('createSegwitWallet:start', { userId });
 
-  const walletApi = privy?.walletApi;
-  logStep('createSegwitWallet:wallet_api_check', {
-    hasWalletApi: !!walletApi,
-    createWalletType: typeof walletApi?.createWallet
-  });
-
-  if (!walletApi || typeof walletApi.createWallet !== 'function') {
-    const error = new Error('privy.walletApi.createWallet is not available');
-    error.status = 500;
-    throw error;
-  }
-
   const payload = {
     chain_type: 'bitcoin-segwit',
     owner: {
       user_id: userId
-    },
-    authorization_key_ids: [process.env.PRIVY_AUTHORIZATION_KEY_ID]
+    }
   };
 
-  logStep('createSegwitWallet:calling_createWallet', payload);
+  logStep('createSegwitWallet:calling_rest_api', payload);
 
-  const wallet = await walletApi.createWallet(payload);
-
-  logStep('createSegwitWallet:success', {
-    walletId: wallet?.id ?? null,
-    address: wallet?.address ?? null,
-    chainType: wallet?.chain_type ?? null
+  const response = await fetch('https://api.privy.io/v1/wallets', {
+    method: 'POST',
+    headers: {
+      Authorization: getPrivyBasicAuthHeader(),
+      'Content-Type': 'application/json',
+      'privy-app-id': env.appId
+    },
+    body: JSON.stringify(payload)
   });
 
-  return wallet;
+  const responseText = await response.text();
+
+  logStep('createSegwitWallet:rest_response', {
+    status: response.status,
+    ok: response.ok,
+    body: responseText
+  });
+
+  let parsed;
+  try {
+    parsed = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    parsed = { raw: responseText };
+  }
+
+  if (!response.ok) {
+    const error = new Error(`Privy REST wallet creation failed with status ${response.status}`);
+    error.status = response.status;
+    error.response = parsed;
+    throw error;
+  }
+
+  return parsed;
 }
 
 export default async function handler(req, res) {
