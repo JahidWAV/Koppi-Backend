@@ -60,6 +60,50 @@ async function verifyAccessToken(req) {
   };
 }
 
+async function listBitcoinWalletsForUser(userId) {
+  const url = new URL('https://api.privy.io/v1/wallets');
+  url.searchParams.set('user_id', userId);
+  url.searchParams.set('chain_type', 'bitcoin-segwit');
+  url.searchParams.set('limit', '100');
+
+  logStep('listBitcoinWalletsForUser:calling_rest_api', {
+    url: url.toString(),
+    userId
+  });
+
+  const response = await fetch(url.toString(), {
+    method: 'GET',
+    headers: {
+      Authorization: getPrivyBasicAuthHeader(),
+      'privy-app-id': env.appId
+    }
+  });
+
+  const responseText = await response.text();
+
+  logStep('listBitcoinWalletsForUser:rest_response', {
+    status: response.status,
+    ok: response.ok,
+    body: responseText
+  });
+
+  let parsed;
+  try {
+    parsed = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    parsed = { raw: responseText };
+  }
+
+  if (!response.ok) {
+    const error = new Error(`Privy wallet lookup failed with status ${response.status}`);
+    error.status = response.status;
+    error.response = parsed;
+    throw error;
+  }
+
+  return Array.isArray(parsed?.data) ? parsed.data : [];
+}
+
 async function createSegwitWallet(userId) {
   logStep('createSegwitWallet:start', { userId });
 
@@ -107,6 +151,26 @@ async function createSegwitWallet(userId) {
   return parsed;
 }
 
+async function fetchOrCreateSegwitWallet(userId) {
+  const existingWallets = await listBitcoinWalletsForUser(userId);
+
+  if (existingWallets.length > 0) {
+    const wallet = existingWallets[0];
+
+    logStep('fetchOrCreateSegwitWallet:found_existing_wallet', {
+      walletId: wallet?.id ?? null,
+      address: wallet?.address ?? null,
+      chainType: wallet?.chain_type ?? null
+    });
+
+    return wallet;
+  }
+
+  logStep('fetchOrCreateSegwitWallet:no_existing_wallet');
+
+  return await createSegwitWallet(userId);
+}
+
 export default async function handler(req, res) {
   logStep('handler:start', {
     method: req.method,
@@ -131,7 +195,7 @@ export default async function handler(req, res) {
       claimsKeys: claims ? Object.keys(claims) : []
     });
 
-    const wallet = await createSegwitWallet(userId);
+    const wallet = await fetchOrCreateSegwitWallet(userId);
 
     logStep('handler:success_response', {
       walletId: wallet?.id ?? null,
