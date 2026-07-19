@@ -3,9 +3,9 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": "20.x"
+    "node": "24.x"
   },
   "dependencies": {
-    "@privy-io/node": "^0.52.0"
+    "@privy-io/node": "^0.24.0"
   }
 }
