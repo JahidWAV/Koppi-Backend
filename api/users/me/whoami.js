@@ -1,4 +1,4 @@
-import { privy, getBearerToken } from '../../../../lib/privy.js';
+import { privy, getBearerToken } from '../../../lib/privy.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
