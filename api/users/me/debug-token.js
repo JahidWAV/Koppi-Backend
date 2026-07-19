@@ -1,4 +1,4 @@
-import { privy, getBearerToken } from '../../../lib/privy.js';
+import { getBearerToken, verifyPrivyAccessToken } from '../../../lib/privy.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -12,9 +12,7 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: 'Missing bearer token' });
     }
 
-    const claims = await privy.utils().auth().verifyAccessToken({
-      access_token: token
-    });
+    const claims = await verifyPrivyAccessToken(token);
 
     return res.status(200).json({
       ok: true,
@@ -24,8 +22,7 @@ export default async function handler(req, res) {
     return res.status(500).json({
       error: 'Token verification failed',
       message: error.message,
-      name: error.name,
-      stack: error.stack
+      name: error.name
     });
   }
 }
