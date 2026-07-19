@@ -1,8 +1,0 @@
-{
-  "name": "koppi-backend",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@privy-io/node": "^0.52.0"
-  }
-}
