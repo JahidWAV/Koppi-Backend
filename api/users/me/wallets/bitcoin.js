@@ -14,7 +14,9 @@ function safeSerializeError(error) {
     code: error?.code ?? null,
     stack: error?.stack ?? null,
     cause: error?.cause ?? null,
-    response: error?.response ?? null
+    response: error?.response ?? null,
+    body: error?.body ?? null,
+    data: error?.data ?? null
   };
 }
 
@@ -72,7 +74,8 @@ async function createSegwitWallet(userId) {
     chain_type: 'bitcoin-segwit',
     owner: {
       user_id: userId
-    }
+    },
+    authorization_key_ids: [process.env.PRIVY_AUTHORIZATION_KEY_ID]
   };
 
   logStep('createSegwitWallet:calling_createWallet', payload);
@@ -135,6 +138,11 @@ export default async function handler(req, res) {
 
     return res.status(error?.status || 500).json({
       error: 'Wallet creation failed',
+      message: error?.message ?? null,
+      name: error?.name ?? null,
+      code: error?.code ?? null,
+      cause: error?.cause ?? null,
+      response: error?.response ?? null,
       details: serialized
     });
   }
