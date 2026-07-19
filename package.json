@@ -6,6 +6,7 @@
     "node": "24.x"
   },
   "dependencies": {
-    "@privy-io/node": "^0.24.0"
+    "@privy-io/node": "^0.24.0",
+    "jose": "^5.9.6"
   }
 }
