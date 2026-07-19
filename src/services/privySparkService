@@ -1,0 +1,67 @@
+import crypto from 'crypto';
+import { env } from '../config/env.js';
+import { privyFetch } from '../lib/privy.js';
+
+function buildAuthSignatureInput({ url, method, body }) {
+  return {
+    version: 1,
+    url,
+    method,
+    headers: {
+      'privy-app-id': env.privyAppId
+    },
+    body
+  };
+}
+
+function signAuthorizationInput(input) {
+  const payload = JSON.stringify(input);
+
+  const sign = crypto.createSign('SHA256');
+  sign.update(payload);
+  sign.end();
+
+  const privateKeyPem = env.privyAuthorizationPrivateKey.replace(/\\n/g, '\n');
+  return sign.sign(privateKeyPem, 'base64');
+}
+
+export async function createSparkWallet(privyUserId) {
+  return await privyFetch('/v1/wallets', {
+    method: 'POST',
+    body: JSON.stringify({
+      owner: {
+        user_id: privyUserId
+      },
+      chain_type: 'spark'
+    })
+  });
+}
+
+export async function getStaticDepositAddress(walletId) {
+  const url = `https://api.privy.io/v1/wallets/${walletId}/rpc`;
+  const body = {
+    method: 'getStaticDepositAddress',
+    network: 'MAINNET'
+  };
+
+  const authorizationInput = buildAuthSignatureInput({
+    url,
+    method: 'POST',
+    body
+  });
+
+  const signature = signAuthorizationInput(authorizationInput);
+
+  return await privyFetch(`/v1/wallets/${walletId}/rpc`, {
+    method: 'POST',
+    headers: {
+      'privy-authorization-signature': signature
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+export async function findOrCreateSparkWallet(privyUserId) {
+  const created = await createSparkWallet(privyUserId);
+  return created;
+}
