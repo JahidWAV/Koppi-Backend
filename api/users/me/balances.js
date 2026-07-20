@@ -17,7 +17,7 @@ function requireEnv(name, value) {
 function parseJson(text, label) {
   try {
     return JSON.parse(text);
-  } catch (error) {
+  } catch {
     console.error(`${label} invalid JSON`, text);
     throw new Error(`${label} returned invalid JSON`);
   }
@@ -42,11 +42,11 @@ async function getAuthenticatedUser(token) {
   return parseJson(text, 'debug-token');
 }
 
-async function getPrivyUserWallets(privyUserId) {
+async function getPrivyAccountBalance(accountId) {
   const appId = requireEnv('PRIVY_APP_ID', PRIVY_APP_ID);
   const appSecret = requireEnv('PRIVY_APP_SECRET', PRIVY_APP_SECRET);
 
-  const url = `${PRIVY_BASE_URL}/v1/wallets?owner_id=${encodeURIComponent(privyUserId)}`;
+  const url = `${PRIVY_BASE_URL}/v1/accounts/${encodeURIComponent(accountId)}/balance`;
 
   const response = await fetch(url, {
     method: 'GET',
@@ -60,50 +60,11 @@ async function getPrivyUserWallets(privyUserId) {
   const text = await response.text();
 
   if (!response.ok) {
-    console.error('Privy wallets error', response.status, text);
-    throw new Error(`Failed to fetch Privy wallets: ${response.status}`);
+    console.error('Privy account balance error', response.status, text);
+    throw new Error(`Failed to fetch Privy account balance: ${response.status}`);
   }
 
-  const parsed = parseJson(text, 'Privy wallets');
-  const wallets = Array.isArray(parsed) ? parsed : parsed.wallets || parsed.data || parsed.results || [];
-
-  console.log('Privy wallets fetched', wallets);
-  return wallets;
-}
-
-async function fetchWalletBalance(walletId, asset, chain) {
-  const appId = requireEnv('PRIVY_APP_ID', PRIVY_APP_ID);
-  const appSecret = requireEnv('PRIVY_APP_SECRET', PRIVY_APP_SECRET);
-
-  const url = new URL(`${PRIVY_BASE_URL}/v1/wallets/${walletId}/balance`);
-  const assets = Array.isArray(asset) ? asset : [asset];
-  const chains = Array.isArray(chain) ? chain : [chain];
-
-  assets.forEach((a) => url.searchParams.append('asset', a));
-  chains.forEach((c) => url.searchParams.append('chain', c));
-  url.searchParams.set('include_currency', 'usd');
-
-  const response = await fetch(url.toString(), {
-    method: 'GET',
-    headers: {
-      Authorization: basicAuthHeader(appId, appSecret),
-      'privy-app-id': appId,
-      Accept: 'application/json',
-    },
-  });
-
-  const text = await response.text();
-
-  if (!response.ok) {
-    console.error('Privy wallet balance error', response.status, text, {
-      walletId,
-      asset: assets,
-      chain: chains,
-    });
-    throw new Error(`Failed wallet balance fetch: ${response.status}`);
-  }
-
-  return parseJson(text, 'Privy wallet balance');
+  return parseJson(text, 'Privy account balance');
 }
 
 async function fetchBitcoinBalanceFromKoppi(token) {
@@ -125,26 +86,42 @@ async function fetchBitcoinBalanceFromKoppi(token) {
   return parseJson(text, 'Bitcoin balance');
 }
 
-function normalizeEntry(entries, chain, assetKey, fallbackSymbol) {
-  const entry = (entries || []).find(
-    (item) =>
-      String(item.chain || '').toLowerCase() === chain.toLowerCase() &&
-      String(item.asset || '').toLowerCase() === assetKey.toLowerCase()
-  );
-
-  return {
-    chain,
-    symbol: fallbackSymbol,
-    amount: entry?.display_values?.[assetKey.toLowerCase()] || '0',
-    fiatValue: entry?.display_values?.usd || '0',
-    rawValue: entry?.raw_value || '0',
-    decimals: entry?.raw_value_decimals || 0,
-  };
-}
-
 function toSafeNumber(value) {
   const parsed = Number(value ?? '0');
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function mapAssetsToNetworks(assets) {
+  const find = (symbol, chainList) =>
+    (assets || []).find((a) => {
+      const s = String(a.symbol || '').toUpperCase();
+      const chain = String(a.chain || '').toLowerCase();
+      return s === symbol.toUpperCase() && chainList.includes(chain);
+    });
+
+  const pick = (asset, fallbackSymbol) => {
+    if (!asset) {
+      return {
+        symbol: fallbackSymbol,
+        amount: '0',
+        fiatValue: '0',
+      };
+    }
+
+    return {
+      symbol: asset.symbol || fallbackSymbol,
+      amount: asset.amount || '0',
+      fiatValue: asset.value || '0',
+    };
+  };
+
+  return {
+    ethereum: pick(find('ETH', ['ethereum']), 'ETH'),
+    base: pick(find('ETH', ['base']), 'ETH'),
+    arbitrum: pick(find('ETH', ['arbitrum']), 'ETH'),
+    polygon: pick(find('POL', ['polygon']), 'POL'),
+    solana: pick(find('SOL', ['solana']), 'SOL'),
+  };
 }
 
 export default async function handler(req, res) {
@@ -175,43 +152,21 @@ export default async function handler(req, res) {
     }
 
     const privyUserId = debugUser.claims.userId;
+    const accountId = debugUser.claims.rawClaims?.accountId || debugUser.claims.rawClaims?.account_id || null;
+
     console.log('Using Privy user id', privyUserId);
+    console.log('Using Privy account id', accountId);
 
-    const wallets = await getPrivyUserWallets(privyUserId);
+    let privyBalance = null;
 
-    const evmWallet =
-      wallets.find((wallet) => wallet.chain_type === 'ethereum') ||
-      wallets.find((wallet) => wallet.wallet_client_type === 'privy') ||
-      wallets.find((wallet) => wallet.chain_type === 'base') ||
-      wallets.find((wallet) => wallet.chain_type === 'arbitrum') ||
-      wallets.find((wallet) => wallet.chain_type === 'polygon');
-
-    const solanaWallet = wallets.find((wallet) => wallet.chain_type === 'solana') || null;
-
-    if (!evmWallet?.id) {
-      return res.status(400).json({
-        error: 'No EVM wallet found for this Privy user',
-        privyUserId,
-        wallets,
-      });
+    if (accountId) {
+      privyBalance = await getPrivyAccountBalance(accountId);
     }
 
-    const [evmBalances, solBalances, bitcoinBalance] = await Promise.all([
-      fetchWalletBalance(evmWallet.id, ['eth', 'pol'], ['ethereum', 'base', 'arbitrum', 'polygon']),
-      solanaWallet?.id
-        ? fetchWalletBalance(solanaWallet.id, 'sol', 'solana')
-        : Promise.resolve({ balances: [] }),
-      fetchBitcoinBalanceFromKoppi(token),
-    ]);
+    const assets = privyBalance?.assets || [];
+    const networks = mapAssetsToNetworks(assets);
 
-    const evmEntries = evmBalances?.balances || [];
-    const solEntries = solBalances?.balances || [];
-
-    const ethereum = normalizeEntry(evmEntries, 'ethereum', 'eth', 'ETH');
-    const base = normalizeEntry(evmEntries, 'base', 'eth', 'ETH');
-    const arbitrum = normalizeEntry(evmEntries, 'arbitrum', 'eth', 'ETH');
-    const polygon = normalizeEntry(evmEntries, 'polygon', 'pol', 'POL');
-    const solana = normalizeEntry(solEntries, 'solana', 'sol', 'SOL');
+    const bitcoinBalance = await fetchBitcoinBalanceFromKoppi(token);
 
     const bitcoin = bitcoinBalance
       ? {
@@ -228,12 +183,13 @@ export default async function handler(req, res) {
         };
 
     const totalUsd = [
-      ethereum.fiatValue,
-      base.fiatValue,
-      arbitrum.fiatValue,
-      polygon.fiatValue,
-      solana.fiatValue,
+      networks.ethereum.fiatValue,
+      networks.base.fiatValue,
+      networks.arbitrum.fiatValue,
+      networks.polygon.fiatValue,
+      networks.solana.fiatValue,
       bitcoin.fiatValue,
+      privyBalance?.total?.value,
     ]
       .map(toSafeNumber)
       .reduce((sum, value) => sum + value, 0)
@@ -242,29 +198,17 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       privyUserId,
-      wallets: {
-        evm: {
-          id: evmWallet.id || null,
-          address: evmWallet.address || null,
-          chainType: evmWallet.chain_type || null,
-        },
-        solana: solanaWallet
-          ? {
-              id: solanaWallet.id || null,
-              address: solanaWallet.address || null,
-              chainType: solanaWallet.chain_type || null,
-            }
-          : null,
-      },
+      accountId,
       balances: {
-        ethereum,
-        base,
-        arbitrum,
-        polygon,
-        solana,
+        ethereum: { chain: 'ethereum', symbol: 'ETH', ...networks.ethereum },
+        base: { chain: 'base', symbol: 'ETH', ...networks.base },
+        arbitrum: { chain: 'arbitrum', symbol: 'ETH', ...networks.arbitrum },
+        polygon: { chain: 'polygon', symbol: 'POL', ...networks.polygon },
+        solana: { chain: 'solana', symbol: 'SOL', ...networks.solana },
         bitcoin,
       },
       totalUsd,
+      privyRaw: privyBalance || null,
     });
   } catch (error) {
     console.error('GET /api/users/me/balances error', error);
