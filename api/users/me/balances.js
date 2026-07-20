@@ -3,6 +3,7 @@ import { Buffer } from 'node:buffer';
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
 const PRIVY_BASE_URL = 'https://api.privy.io';
+const ESPLORA_BASE_URL = 'https://blockstream.info/api';
 
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
@@ -56,6 +57,35 @@ async function fetchWalletBalance(walletId, asset, chain) {
   return parseJson(text, 'Privy wallet balance');
 }
 
+async function fetchBitcoinBalance(address) {
+  const fundedRes = await fetch(`${ESPLORA_BASE_URL}/address/${address}`);
+  if (!fundedRes.ok) {
+    throw new Error(`Failed BTC address fetch: ${fundedRes.status}`);
+  }
+
+  const fundedJson = await fundedRes.json();
+  const funded = fundedJson.chain_stats?.funded_txo_sum || 0;
+  const spent = fundedJson.chain_stats?.spent_txo_sum || 0;
+  const sats = funded - spent;
+  const btcAmount = sats / 100000000;
+
+  const priceRes = await fetch(
+    'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'
+  );
+  if (!priceRes.ok) {
+    throw new Error(`Failed BTC price fetch: ${priceRes.status}`);
+  }
+
+  const priceJson = await priceRes.json();
+  const btcUsd = Number(priceJson?.bitcoin?.usd || 0);
+
+  return {
+    symbol: 'BTC',
+    amount: btcAmount.toString(),
+    fiatValue: (btcAmount * btcUsd).toFixed(2),
+  };
+}
+
 function normalizeEntry(entries, chain, assetKey, symbol) {
   const match = (entries || []).find(
     (item) =>
@@ -89,9 +119,9 @@ export default async function handler(req, res) {
   });
 
   try {
-    const { evmWalletId, solanaWalletId } = req.query;
+    const { evmWalletId, solanaWalletId, bitcoinAddress } = req.query;
 
-    const [evmResponse, solanaResponse] = await Promise.all([
+    const [evmResponse, solanaResponse, bitcoin] = await Promise.all([
       evmWalletId
         ? fetchWalletBalance(
             evmWalletId,
@@ -102,6 +132,9 @@ export default async function handler(req, res) {
       solanaWalletId
         ? fetchWalletBalance(solanaWalletId, 'sol', 'solana')
         : Promise.resolve({ balances: [] }),
+      bitcoinAddress
+        ? fetchBitcoinBalance(bitcoinAddress)
+        : Promise.resolve({ symbol: 'BTC', amount: '0', fiatValue: '0' }),
     ]);
 
     const evmEntries = evmResponse.balances || [];
@@ -135,11 +168,7 @@ export default async function handler(req, res) {
           fiatValue: evmTotalFiat.toFixed(2),
         },
         solana,
-        bitcoin: {
-          symbol: 'BTC',
-          amount: '0',
-          fiatValue: '0',
-        },
+        bitcoin,
       },
       networks: {
         ethereum,
