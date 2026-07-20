@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { getBearerToken, verifyPrivyAccessToken } from '../../../lib/privy.js';
 
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
@@ -14,12 +15,95 @@ function basicAuthHeader(appId, appSecret) {
   return `Basic ${Buffer.from(`${appId}:${appSecret}`).toString('base64')}`;
 }
 
-function parseJson(text, label) {
+async function fetchJson(url, options, label) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+
+  let json = null;
   try {
-    return JSON.parse(text);
+    json = text ? JSON.parse(text) : null;
   } catch {
     throw new Error(`${label} returned invalid JSON`);
   }
+
+  if (!response.ok) {
+    console.error(`${label} error`, response.status, json ?? text);
+    throw new Error(`${label} failed: ${response.status}`);
+  }
+
+  return json;
+}
+
+async function fetchPrivyUserById(userId) {
+  const appId = requireEnv('PRIVY_APP_ID', PRIVY_APP_ID);
+  const appSecret = requireEnv('PRIVY_APP_SECRET', PRIVY_APP_SECRET);
+
+  return fetchJson(
+    `${PRIVY_BASE_URL}/v1/users/${userId}`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: basicAuthHeader(appId, appSecret),
+        'privy-app-id': appId,
+        Accept: 'application/json',
+      },
+    },
+    'Privy get user'
+  );
+}
+
+function extractWalletsFromUserResponse(payload) {
+  const user = payload?.data ?? payload?.user ?? payload;
+
+  const linkedAccounts = user?.linked_accounts ?? user?.linkedAccounts ?? [];
+  const wallets = [];
+
+  for (const account of linkedAccounts) {
+    const address = account?.address;
+    const id = account?.id;
+    const type = account?.type;
+    const chainType = account?.chain_type ?? account?.chainType;
+
+    const isWalletLike =
+      type === 'wallet' ||
+      type === 'ethereum_wallet' ||
+      type === 'solana_wallet' ||
+      type === 'cross_app_wallet' ||
+      type === 'smart_wallet' ||
+      String(type || '').includes('wallet');
+
+    if (isWalletLike && address) {
+      wallets.push({
+        id,
+        address,
+        chainType,
+        type,
+      });
+    }
+  }
+
+  return wallets;
+}
+
+function findWalletIdByAddress(wallets, address, expectedChainType) {
+  if (!address) return null;
+
+  const normalizedAddress = String(address).toLowerCase();
+
+  const exactChainMatch = wallets.find(
+    (wallet) =>
+      wallet.address?.toLowerCase() === normalizedAddress &&
+      (!expectedChainType ||
+        String(wallet.chainType || '').toLowerCase() === expectedChainType.toLowerCase())
+  );
+
+  if (exactChainMatch?.id) return exactChainMatch.id;
+
+  const fallbackMatch = wallets.find(
+    (wallet) => wallet.address?.toLowerCase() === normalizedAddress
+  );
+
+  return fallbackMatch?.id ?? null;
 }
 
 async function fetchWalletBalance(walletId, asset, chain) {
@@ -34,49 +118,38 @@ async function fetchWalletBalance(walletId, asset, chain) {
   for (const c of chains) url.searchParams.append('chain', c);
   url.searchParams.set('include_currency', 'usd');
 
-  const response = await fetch(url.toString(), {
-    method: 'GET',
-    headers: {
-      Authorization: basicAuthHeader(appId, appSecret),
-      'privy-app-id': appId,
-      Accept: 'application/json',
+  return fetchJson(
+    url.toString(),
+    {
+      method: 'GET',
+      headers: {
+        Authorization: basicAuthHeader(appId, appSecret),
+        'privy-app-id': appId,
+        Accept: 'application/json',
+      },
     },
-  });
-
-  const text = await response.text();
-
-  if (!response.ok) {
-    console.error('Privy wallet balance error', response.status, text, {
-      walletId,
-      assets,
-      chains,
-    });
-    throw new Error(`Failed wallet balance fetch: ${response.status}`);
-  }
-
-  return parseJson(text, 'Privy wallet balance');
+    'Privy wallet balance'
+  );
 }
 
 async function fetchBitcoinBalance(address) {
-  const fundedRes = await fetch(`${ESPLORA_BASE_URL}/address/${address}`);
-  if (!fundedRes.ok) {
-    throw new Error(`Failed BTC address fetch: ${fundedRes.status}`);
-  }
+  const fundedJson = await fetchJson(
+    `${ESPLORA_BASE_URL}/address/${address}`,
+    { method: 'GET', headers: { Accept: 'application/json' } },
+    'Esplora address'
+  );
 
-  const fundedJson = await fundedRes.json();
   const funded = fundedJson.chain_stats?.funded_txo_sum || 0;
   const spent = fundedJson.chain_stats?.spent_txo_sum || 0;
   const sats = funded - spent;
   const btcAmount = sats / 100000000;
 
-  const priceRes = await fetch(
-    'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd'
+  const priceJson = await fetchJson(
+    'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
+    { method: 'GET', headers: { Accept: 'application/json' } },
+    'CoinGecko BTC price'
   );
-  if (!priceRes.ok) {
-    throw new Error(`Failed BTC price fetch: ${priceRes.status}`);
-  }
 
-  const priceJson = await priceRes.json();
   const btcUsd = Number(priceJson?.bitcoin?.usd || 0);
 
   return {
@@ -119,7 +192,35 @@ export default async function handler(req, res) {
   });
 
   try {
-    const { evmWalletId, solanaWalletId, bitcoinAddress } = req.query;
+    const token = getBearerToken(req);
+    if (!token) {
+      return res.status(401).json({ ok: false, error: 'Missing bearer token' });
+    }
+
+    const claims = await verifyPrivyAccessToken(token);
+    const userId = claims?.sub || claims?.userId || claims?.user_id;
+
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: 'Missing Privy user id in token claims' });
+    }
+
+    const { evmAddress, solanaAddress, bitcoinAddress } = req.query;
+
+    const userPayload = await fetchPrivyUserById(userId);
+    const wallets = extractWalletsFromUserResponse(userPayload);
+
+    const evmWalletId = findWalletIdByAddress(wallets, evmAddress, 'ethereum');
+    const solanaWalletId = findWalletIdByAddress(wallets, solanaAddress, 'solana');
+
+    console.log('resolved wallet ids', {
+      userId,
+      evmAddress,
+      evmWalletId,
+      solanaAddress,
+      solanaWalletId,
+      bitcoinAddress,
+      walletCount: wallets.length,
+    });
 
     const [evmResponse, solanaResponse, bitcoin] = await Promise.all([
       evmWalletId
@@ -137,8 +238,8 @@ export default async function handler(req, res) {
         : Promise.resolve({ symbol: 'BTC', amount: '0', fiatValue: '0' }),
     ]);
 
-    const evmEntries = evmResponse.balances || [];
-    const solEntries = solanaResponse.balances || [];
+    const evmEntries = evmResponse.balances || evmResponse.data?.balances || [];
+    const solEntries = solanaResponse.balances || solanaResponse.data?.balances || [];
 
     const ethereum = normalizeEntry(evmEntries, 'ethereum', 'eth', 'ETH');
     const base = normalizeEntry(evmEntries, 'base', 'eth', 'ETH');
@@ -176,6 +277,10 @@ export default async function handler(req, res) {
         arbitrum,
         polygon,
         solana,
+      },
+      resolvedWallets: {
+        evmWalletId,
+        solanaWalletId,
       },
     });
   } catch (error) {
