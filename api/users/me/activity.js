@@ -2,10 +2,16 @@ const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
 const PRIVY_ORIGIN = process.env.PRIVY_ORIGIN || 'https://api.koppi.app';
 
+const userCache = new Map();
+
 function sendJson(res, status, body) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify(body));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function logStep(step, data = {}) {
@@ -56,11 +62,7 @@ async function privyFetch(path) {
   return response.json();
 }
 
-async function getCurrentPrivyUser(accessToken) {
-  if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
-    throw new Error('Missing PRIVY_APP_ID or PRIVY_APP_SECRET');
-  }
-
+async function fetchCurrentPrivyUserOnce(accessToken) {
   const response = await fetch('https://auth.privy.io/api/v1/users/me', {
     method: 'GET',
     headers: {
@@ -73,7 +75,9 @@ async function getCurrentPrivyUser(accessToken) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Privy auth error ${response.status}: ${text}`);
+    const error = new Error(`Privy auth error ${response.status}: ${text}`);
+    error.status = response.status;
+    throw error;
   }
 
   const data = await response.json();
@@ -87,6 +91,46 @@ async function getCurrentPrivyUser(accessToken) {
     raw: data,
     id: userId,
   };
+}
+
+async function getCurrentPrivyUser(accessToken) {
+  if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
+    throw new Error('Missing PRIVY_APP_ID or PRIVY_APP_SECRET');
+  }
+
+  const cached = userCache.get(accessToken);
+  const now = Date.now();
+
+  if (cached && cached.expiresAt > now) {
+    return cached.value;
+  }
+
+  let lastError = null;
+  const delays = [0, 800, 1800, 3500];
+
+  for (const delay of delays) {
+    if (delay > 0) {
+      await sleep(delay);
+    }
+
+    try {
+      const user = await fetchCurrentPrivyUserOnce(accessToken);
+      userCache.set(accessToken, {
+        value: user,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+      });
+      return user;
+    } catch (error) {
+      lastError = error;
+      const status = error?.status ?? null;
+
+      if (status !== 429) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error('Failed to load current Privy user');
 }
 
 async function getWalletsForUser(userId) {
