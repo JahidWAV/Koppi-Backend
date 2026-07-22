@@ -187,7 +187,9 @@ async function getBitcoinActivity(bitcoinAddress) {
       const net = netValueForBitcoinAddress(tx, bitcoinAddress);
       const direction = net > 0 ? 'incoming' : net < 0 ? 'outgoing' : 'neutral';
       const sign = net > 0 ? '+' : net < 0 ? '-' : '';
-      const timestamp = new Date((tx.status && tx.status.block_time ? tx.status.block_time : 0) * 1000).toISOString();
+      const timestamp = new Date(
+        ((tx.status && tx.status.block_time) || 0) * 1000
+      ).toISOString();
 
       return {
         id: tx.txid,
@@ -210,7 +212,7 @@ async function getBitcoinActivity(bitcoinAddress) {
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   if (req.method !== 'GET') {
     return sendJson(res, 405, { error: 'Method not allowed' });
   }
@@ -252,4 +254,4 @@ module.exports = async function handler(req, res) {
       details: message,
     });
   }
-};
+}
