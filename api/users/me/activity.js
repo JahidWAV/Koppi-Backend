@@ -1,5 +1,6 @@
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
+const PRIVY_ORIGIN = process.env.PRIVY_ORIGIN || 'https://api.koppi.app';
 
 function sendJson(res, status, body) {
   res.statusCode = status;
@@ -65,6 +66,7 @@ async function getCurrentPrivyUser(accessToken) {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'privy-app-id': PRIVY_APP_ID,
+      Origin: PRIVY_ORIGIN,
       Accept: 'application/json',
     },
   });
@@ -270,6 +272,7 @@ export default async function handler(req, res) {
     environment: {
       hasPrivyAppId: Boolean(PRIVY_APP_ID),
       hasPrivyAppSecret: Boolean(PRIVY_APP_SECRET),
+      privyOrigin: PRIVY_ORIGIN,
     },
     request: {
       method: req.method,
