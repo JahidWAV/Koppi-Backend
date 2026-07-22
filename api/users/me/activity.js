@@ -56,10 +56,15 @@ async function privyFetch(path) {
 }
 
 async function getCurrentPrivyUser(accessToken) {
+  if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
+    throw new Error('Missing PRIVY_APP_ID or PRIVY_APP_SECRET');
+  }
+
   const response = await fetch('https://auth.privy.io/api/v1/users/me', {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${accessToken}`,
+      'privy-app-id': PRIVY_APP_ID,
       Accept: 'application/json',
     },
   });
