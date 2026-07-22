@@ -94,10 +94,6 @@ async function fetchCurrentPrivyUserOnce(accessToken) {
 }
 
 async function getCurrentPrivyUser(accessToken) {
-  if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
-    throw new Error('Missing PRIVY_APP_ID or PRIVY_APP_SECRET');
-  }
-
   const cached = userCache.get(accessToken);
   const now = Date.now();
 
@@ -109,9 +105,7 @@ async function getCurrentPrivyUser(accessToken) {
   const delays = [0, 800, 1800, 3500];
 
   for (const delay of delays) {
-    if (delay > 0) {
-      await sleep(delay);
-    }
+    if (delay > 0) await sleep(delay);
 
     try {
       const user = await fetchCurrentPrivyUserOnce(accessToken);
@@ -122,11 +116,7 @@ async function getCurrentPrivyUser(accessToken) {
       return user;
     } catch (error) {
       lastError = error;
-      const status = error?.status ?? null;
-
-      if (status !== 429) {
-        throw error;
-      }
+      if (error?.status !== 429) throw error;
     }
   }
 
@@ -151,32 +141,31 @@ function pickWallet(wallets, chainType) {
   return matches[0];
 }
 
-async function getPrivyTransactions(walletId, chain) {
-  const params = new URLSearchParams({
-    chain,
-    limit: '50',
-  });
+function safeDisplayNumber(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
 
-  const response = await privyFetch(
-    `/v1/wallets/${walletId}/transactions?${params.toString()}`
-  );
-
-  return response.transactions || [];
+function normalizeTimestamp(value) {
+  if (typeof value === 'string') {
+    const d = new Date(value);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  if (typeof value === 'number') {
+    const ms = value > 1e12 ? value : value * 1000;
+    const d = new Date(ms);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  return new Date(0).toISOString();
 }
 
 function symbolForAsset(asset, chain) {
   const normalized = String(asset || '').toLowerCase();
   if (normalized === 'eth') return 'ETH';
   if (normalized === 'sol') return 'SOL';
-  if (normalized === 'usdc') return 'USDC';
-  if (normalized === 'usdt') return 'USDT';
-  return chain === 'base' ? 'ETH' : 'SOL';
-}
-
-function safeDisplayNumber(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  return n;
+  if (normalized === 'btc') return 'BTC';
+  return chain === 'base' ? 'ETH' : chain === 'solana' ? 'SOL' : 'BTC';
 }
 
 function formatPrivyAmount(detail, chain) {
@@ -189,34 +178,15 @@ function formatPrivyAmount(detail, chain) {
     null;
   const sign = detail.type === 'transfer_received' ? '+' : '-';
 
-  if (display) {
-    return `${sign}${display} ${symbol}`;
-  }
+  if (display) return `${sign}${display} ${symbol}`;
 
   const raw = safeDisplayNumber(detail.raw_value || 0);
   const decimals = safeDisplayNumber(detail.raw_value_decimals || 0) ?? 0;
 
-  if (raw === null) {
-    return `${sign}0 ${symbol}`;
-  }
+  if (raw === null) return `${sign}0 ${symbol}`;
 
   const value = decimals > 0 ? raw / Math.pow(10, decimals) : raw;
   return `${sign}${value} ${symbol}`;
-}
-
-function normalizePrivyTimestamp(value) {
-  if (typeof value === 'string') {
-    const date = new Date(value);
-    if (!Number.isNaN(date.getTime())) return date.toISOString();
-  }
-
-  if (typeof value === 'number') {
-    const millis = value > 1e12 ? value : value * 1000;
-    const date = new Date(millis);
-    if (!Number.isNaN(date.getTime())) return date.toISOString();
-  }
-
-  return new Date(0).toISOString();
 }
 
 function mapPrivyTransaction(tx, chain) {
@@ -237,10 +207,10 @@ function mapPrivyTransaction(tx, chain) {
     id: tx.privy_transaction_id || tx.id || tx.transaction_hash || `${chain}-${tx.created_at}`,
     chain,
     title: isIncoming ? `Received ${symbol}` : `Sent ${symbol}`,
-    subtitle: chain === 'base' ? 'Base' : 'Solana',
+    subtitle: chain === 'base' ? 'Base' : chain === 'solana' ? 'Solana' : 'Bitcoin',
     amountText: formatPrivyAmount(detail, chain),
     fiatText: null,
-    timestamp: normalizePrivyTimestamp(tx.created_at),
+    timestamp: normalizeTimestamp(tx.created_at),
     txHash: tx.transaction_hash || null,
     status: tx.status || 'confirmed',
     direction,
@@ -311,6 +281,27 @@ async function getBitcoinActivity(bitcoinAddress) {
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 }
 
+async function getPrivyTransactionsForWallet(walletId, chain) {
+  const params = new URLSearchParams({
+    chain,
+    limit: '50',
+  });
+
+  if (chain === 'base') {
+    params.set('asset', 'eth');
+  } else if (chain === 'solana') {
+    params.set('token', 'sol');
+  } else if (chain === 'bitcoin') {
+    params.set('asset', 'btc');
+  }
+
+  const response = await privyFetch(
+    `/v1/wallets/${walletId}/transactions?${params.toString()}`
+  );
+
+  return response.transactions || response.data || [];
+}
+
 export default async function handler(req, res) {
   const debug = {
     environment: {
@@ -327,28 +318,19 @@ export default async function handler(req, res) {
   };
 
   if (req.method !== 'GET') {
-    return sendJson(res, 405, {
-      error: 'Method not allowed',
-      debug,
-    });
+    return sendJson(res, 405, { error: 'Method not allowed', debug });
   }
 
   try {
     const accessToken = getBearerToken(req);
-    debug.checkpoints.push({
-      step: 'bearer-token',
-      present: Boolean(accessToken),
-    });
+    debug.checkpoints.push({ step: 'bearer-token', present: Boolean(accessToken) });
     logStep('activity:start', {
       hasBearer: Boolean(accessToken),
       hasBitcoinAddress: typeof req.query.bitcoinAddress === 'string',
     });
 
     if (!accessToken) {
-      return sendJson(res, 401, {
-        error: 'Missing bearer token',
-        debug,
-      });
+      return sendJson(res, 401, { error: 'Missing bearer token', debug });
     }
 
     const bitcoinAddress =
@@ -357,10 +339,7 @@ export default async function handler(req, res) {
         : undefined;
 
     const currentUser = await getCurrentPrivyUser(accessToken);
-    debug.checkpoints.push({
-      step: 'current-user',
-      privyUserId: currentUser.id,
-    });
+    debug.checkpoints.push({ step: 'current-user', privyUserId: currentUser.id });
     logStep('activity:user', { privyUserId: currentUser.id });
 
     const wallets = await getWalletsForUser(currentUser.id);
@@ -384,6 +363,7 @@ export default async function handler(req, res) {
 
     const evmWallet = pickWallet(wallets, 'ethereum');
     const solanaWallet = pickWallet(wallets, 'solana');
+    const bitcoinWallet = pickWallet(wallets, 'bitcoin-segwit');
 
     debug.checkpoints.push({
       step: 'wallets-selected',
@@ -391,18 +371,19 @@ export default async function handler(req, res) {
       evmWalletAddress: evmWallet?.address ?? null,
       solanaWalletId: solanaWallet?.id ?? null,
       solanaWalletAddress: solanaWallet?.address ?? null,
-      bitcoinAddress: bitcoinAddress ?? null,
+      bitcoinWalletId: bitcoinWallet?.id ?? null,
+      bitcoinAddress: bitcoinAddress ?? bitcoinWallet?.address ?? null,
     });
     logStep('activity:selected-wallets', {
       evmWalletId: evmWallet?.id ?? null,
       solanaWalletId: solanaWallet?.id ?? null,
-      bitcoinAddress: bitcoinAddress ?? null,
+      bitcoinAddress: bitcoinAddress ?? bitcoinWallet?.address ?? null,
     });
 
     const [baseTxs, solTxs, btcTxs] = await Promise.all([
-      evmWallet ? getPrivyTransactions(evmWallet.id, 'base') : Promise.resolve([]),
-      solanaWallet ? getPrivyTransactions(solanaWallet.id, 'solana') : Promise.resolve([]),
-      getBitcoinActivity(bitcoinAddress),
+      evmWallet ? getPrivyTransactionsForWallet(evmWallet.id, 'base') : Promise.resolve([]),
+      solanaWallet ? getPrivyTransactionsForWallet(solanaWallet.id, 'solana') : Promise.resolve([]),
+      bitcoinWallet ? getPrivyTransactionsForWallet(bitcoinWallet.id, 'bitcoin') : Promise.resolve([]),
     ]);
 
     debug.checkpoints.push({
@@ -420,7 +401,8 @@ export default async function handler(req, res) {
     const items = [
       ...baseTxs.map((tx) => mapPrivyTransaction(tx, 'base')).filter(Boolean),
       ...solTxs.map((tx) => mapPrivyTransaction(tx, 'solana')).filter(Boolean),
-      ...btcTxs,
+      ...btcTxs.map((tx) => mapPrivyTransaction(tx, 'bitcoin')).filter(Boolean),
+      ...getBitcoinActivity(bitcoinAddress ?? bitcoinWallet?.address),
     ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
     debug.checkpoints.push({
@@ -428,14 +410,9 @@ export default async function handler(req, res) {
       itemCount: items.length,
       preview: items.slice(0, 10),
     });
-    logStep('activity:items-mapped', {
-      itemCount: items.length,
-    });
+    logStep('activity:items-mapped', { itemCount: items.length });
 
-    return sendJson(res, 200, {
-      items,
-      debug,
-    });
+    return sendJson(res, 200, { items, debug });
   } catch (error) {
     debug.checkpoints.push({
       step: 'error',
