@@ -7,6 +7,21 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+function logStep(step, data = {}) {
+  console.log(JSON.stringify({ step, ...data }));
+}
+
+function logError(step, error, data = {}) {
+  console.error(
+    JSON.stringify({
+      step,
+      ...data,
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : null,
+    })
+  );
+}
+
 function getBearerToken(req) {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Bearer ')) return null;
@@ -40,7 +55,7 @@ async function privyFetch(path) {
   return response.json();
 }
 
-async function getCurrentPrivyUserId(accessToken) {
+async function getCurrentPrivyUser(accessToken) {
   const response = await fetch('https://auth.privy.io/api/v1/users/me', {
     method: 'GET',
     headers: {
@@ -55,13 +70,16 @@ async function getCurrentPrivyUserId(accessToken) {
   }
 
   const data = await response.json();
-  const userId = data?.user?.id ?? data?.id;
+  const userId = data?.user?.id ?? data?.id ?? null;
 
   if (!userId) {
     throw new Error('Could not resolve current Privy user id');
   }
 
-  return userId;
+  return {
+    raw: data,
+    id: userId,
+  };
 }
 
 async function getWalletsForUser(userId) {
@@ -104,27 +122,58 @@ function symbolForAsset(asset, chain) {
   return chain === 'base' ? 'ETH' : 'SOL';
 }
 
+function safeDisplayNumber(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
 function formatPrivyAmount(detail, chain) {
   const symbol = symbolForAsset(detail.asset, chain);
   const key = String(detail.asset || '').toLowerCase();
-  const display = detail.display_values && detail.display_values[key];
+  const display =
+    detail.display_values?.[key] ??
+    detail.display_values?.amount ??
+    detail.display_values?.display_amount ??
+    null;
   const sign = detail.type === 'transfer_received' ? '+' : '-';
 
   if (display) {
     return `${sign}${display} ${symbol}`;
   }
 
-  const raw = Number(detail.raw_value || 0);
-  const decimals = Number(detail.raw_value_decimals || 0);
-  const value = decimals > 0 ? raw / Math.pow(10, decimals) : raw;
+  const raw = safeDisplayNumber(detail.raw_value || 0);
+  const decimals = safeDisplayNumber(detail.raw_value_decimals || 0) ?? 0;
 
+  if (raw === null) {
+    return `${sign}0 ${symbol}`;
+  }
+
+  const value = decimals > 0 ? raw / Math.pow(10, decimals) : raw;
   return `${sign}${value} ${symbol}`;
 }
 
+function normalizePrivyTimestamp(value) {
+  if (typeof value === 'string') {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+  }
+
+  if (typeof value === 'number') {
+    const millis = value > 1e12 ? value : value * 1000;
+    const date = new Date(millis);
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+  }
+
+  return new Date(0).toISOString();
+}
+
 function mapPrivyTransaction(tx, chain) {
-  if (!tx || !tx.details) return null;
+  if (!tx) return null;
 
   const detail = tx.details;
+  if (!detail) return null;
+
   if (detail.type !== 'transfer_sent' && detail.type !== 'transfer_received') {
     return null;
   }
@@ -134,13 +183,13 @@ function mapPrivyTransaction(tx, chain) {
   const isIncoming = direction === 'incoming';
 
   return {
-    id: tx.privy_transaction_id || tx.transaction_hash || `${chain}-${tx.created_at}`,
+    id: tx.privy_transaction_id || tx.id || tx.transaction_hash || `${chain}-${tx.created_at}`,
     chain,
     title: isIncoming ? `Received ${symbol}` : `Sent ${symbol}`,
     subtitle: chain === 'base' ? 'Base' : 'Solana',
     amountText: formatPrivyAmount(detail, chain),
     fiatText: null,
-    timestamp: new Date(tx.created_at).toISOString(),
+    timestamp: normalizePrivyTimestamp(tx.created_at),
     txHash: tx.transaction_hash || null,
     status: tx.status || 'confirmed',
     direction,
@@ -187,9 +236,8 @@ async function getBitcoinActivity(bitcoinAddress) {
       const net = netValueForBitcoinAddress(tx, bitcoinAddress);
       const direction = net > 0 ? 'incoming' : net < 0 ? 'outgoing' : 'neutral';
       const sign = net > 0 ? '+' : net < 0 ? '-' : '';
-      const timestamp = new Date(
-        ((tx.status && tx.status.block_time) || 0) * 1000
-      ).toISOString();
+      const blockTime = tx?.status?.block_time || 0;
+      const timestamp = new Date(blockTime * 1000).toISOString();
 
       return {
         id: tx.txid,
@@ -200,12 +248,12 @@ async function getBitcoinActivity(bitcoinAddress) {
             : direction === 'outgoing'
             ? 'Sent BTC'
             : 'Bitcoin transfer',
-        subtitle: tx.status && tx.status.confirmed ? 'Bitcoin' : 'Bitcoin · Pending',
+        subtitle: tx?.status?.confirmed ? 'Bitcoin' : 'Bitcoin · Pending',
         amountText: `${sign}${satoshisToBTCString(Math.abs(net))} BTC`,
         fiatText: null,
         timestamp,
         txHash: tx.txid,
-        status: tx.status && tx.status.confirmed ? 'confirmed' : 'pending',
+        status: tx?.status?.confirmed ? 'confirmed' : 'pending',
         direction,
       };
     })
@@ -213,14 +261,42 @@ async function getBitcoinActivity(bitcoinAddress) {
 }
 
 export default async function handler(req, res) {
+  const debug = {
+    environment: {
+      hasPrivyAppId: Boolean(PRIVY_APP_ID),
+      hasPrivyAppSecret: Boolean(PRIVY_APP_SECRET),
+    },
+    request: {
+      method: req.method,
+      hasAuthorizationHeader: Boolean(req.headers.authorization),
+      hasBitcoinAddress: typeof req.query.bitcoinAddress === 'string',
+    },
+    checkpoints: [],
+  };
+
   if (req.method !== 'GET') {
-    return sendJson(res, 405, { error: 'Method not allowed' });
+    return sendJson(res, 405, {
+      error: 'Method not allowed',
+      debug,
+    });
   }
 
   try {
     const accessToken = getBearerToken(req);
+    debug.checkpoints.push({
+      step: 'bearer-token',
+      present: Boolean(accessToken),
+    });
+    logStep('activity:start', {
+      hasBearer: Boolean(accessToken),
+      hasBitcoinAddress: typeof req.query.bitcoinAddress === 'string',
+    });
+
     if (!accessToken) {
-      return sendJson(res, 401, { error: 'Missing bearer token' });
+      return sendJson(res, 401, {
+        error: 'Missing bearer token',
+        debug,
+      });
     }
 
     const bitcoinAddress =
@@ -228,11 +304,48 @@ export default async function handler(req, res) {
         ? req.query.bitcoinAddress
         : undefined;
 
-    const privyUserId = await getCurrentPrivyUserId(accessToken);
-    const wallets = await getWalletsForUser(privyUserId);
+    const currentUser = await getCurrentPrivyUser(accessToken);
+    debug.checkpoints.push({
+      step: 'current-user',
+      privyUserId: currentUser.id,
+    });
+    logStep('activity:user', { privyUserId: currentUser.id });
+
+    const wallets = await getWalletsForUser(currentUser.id);
+    debug.checkpoints.push({
+      step: 'wallets-loaded',
+      walletCount: wallets.length,
+      wallets: wallets.map((wallet) => ({
+        id: wallet.id,
+        chain_type: wallet.chain_type,
+        address: wallet.address,
+      })),
+    });
+    logStep('activity:wallets', {
+      walletCount: wallets.length,
+      walletChains: wallets.map((wallet) => ({
+        id: wallet.id,
+        chain_type: wallet.chain_type,
+        address: wallet.address,
+      })),
+    });
 
     const evmWallet = pickWallet(wallets, 'ethereum');
     const solanaWallet = pickWallet(wallets, 'solana');
+
+    debug.checkpoints.push({
+      step: 'wallets-selected',
+      evmWalletId: evmWallet?.id ?? null,
+      evmWalletAddress: evmWallet?.address ?? null,
+      solanaWalletId: solanaWallet?.id ?? null,
+      solanaWalletAddress: solanaWallet?.address ?? null,
+      bitcoinAddress: bitcoinAddress ?? null,
+    });
+    logStep('activity:selected-wallets', {
+      evmWalletId: evmWallet?.id ?? null,
+      solanaWalletId: solanaWallet?.id ?? null,
+      bitcoinAddress: bitcoinAddress ?? null,
+    });
 
     const [baseTxs, solTxs, btcTxs] = await Promise.all([
       evmWallet ? getPrivyTransactions(evmWallet.id, 'base') : Promise.resolve([]),
@@ -240,18 +353,49 @@ export default async function handler(req, res) {
       getBitcoinActivity(bitcoinAddress),
     ]);
 
+    debug.checkpoints.push({
+      step: 'transactions-fetched',
+      baseCount: baseTxs.length,
+      solanaCount: solTxs.length,
+      bitcoinCount: btcTxs.length,
+    });
+    logStep('activity:transactions-fetched', {
+      baseCount: baseTxs.length,
+      solanaCount: solTxs.length,
+      bitcoinCount: btcTxs.length,
+    });
+
     const items = [
       ...baseTxs.map((tx) => mapPrivyTransaction(tx, 'base')).filter(Boolean),
       ...solTxs.map((tx) => mapPrivyTransaction(tx, 'solana')).filter(Boolean),
       ...btcTxs,
     ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
-    return sendJson(res, 200, { items });
+    debug.checkpoints.push({
+      step: 'items-mapped',
+      itemCount: items.length,
+      preview: items.slice(0, 10),
+    });
+    logStep('activity:items-mapped', {
+      itemCount: items.length,
+    });
+
+    return sendJson(res, 200, {
+      items,
+      debug,
+    });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    debug.checkpoints.push({
+      step: 'error',
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : null,
+    });
+
+    logError('activity:error', error, { debug });
+
     return sendJson(res, 500, {
       error: 'Failed to load activity',
-      details: message,
+      debug,
     });
   }
 }
