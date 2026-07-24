@@ -282,22 +282,29 @@ async function getBitcoinActivity(bitcoinAddress) {
 }
 
 async function getPrivyTransactionsForWallet(walletId, chain) {
+  // Privy's `/v1/wallets/{id}/transactions` endpoint doesn't support
+  // Bitcoin at all — its `chain` enum only covers EVM chains + Solana, and
+  // there's no valid `asset` value for BTC either (confirmed by the 400
+  // error this used to throw: "Invalid enum value ... received 'bitcoin'").
+  // Bitcoin activity comes exclusively from `getBitcoinActivity` (Blockstream)
+  // below, so skip calling Privy for this chain entirely.
+  if (chain === 'bitcoin') {
+    return [];
+  }
+
   const params = new URLSearchParams({
     chain,
     limit: '50',
   });
 
-  // NOTE: all three chains use the `asset` query param (native asset
+  // Both remaining chains use the `asset` query param (native asset
   // symbol) to filter transactions server-side. Solana previously used
   // `token`, which Privy's API rejects with a 400 unless it's a real
-  // mint/contract address — `asset` is the correct param here, matching
-  // `base` and `bitcoin` below.
+  // mint/contract address — `asset` is the correct param here.
   if (chain === 'base') {
     params.set('asset', 'eth');
   } else if (chain === 'solana') {
     params.set('asset', 'sol');
-  } else if (chain === 'bitcoin') {
-    params.set('asset', 'btc');
   }
 
   const response = await privyFetch(
