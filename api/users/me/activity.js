@@ -287,10 +287,15 @@ async function getPrivyTransactionsForWallet(walletId, chain) {
     limit: '50',
   });
 
+  // NOTE: all three chains use the `asset` query param (native asset
+  // symbol) to filter transactions server-side. Solana previously used
+  // `token`, which Privy's API rejects with a 400 unless it's a real
+  // mint/contract address — `asset` is the correct param here, matching
+  // `base` and `bitcoin` below.
   if (chain === 'base') {
     params.set('asset', 'eth');
   } else if (chain === 'solana') {
-    params.set('token', 'sol');
+    params.set('asset', 'sol');
   } else if (chain === 'bitcoin') {
     params.set('asset', 'btc');
   }
@@ -380,10 +385,11 @@ export default async function handler(req, res) {
       bitcoinAddress: bitcoinAddress ?? bitcoinWallet?.address ?? null,
     });
 
-    const [baseTxs, solTxs, btcTxs] = await Promise.all([
+    const [baseTxs, solTxs, btcTxs, bitcoinActivity] = await Promise.all([
       evmWallet ? getPrivyTransactionsForWallet(evmWallet.id, 'base') : Promise.resolve([]),
       solanaWallet ? getPrivyTransactionsForWallet(solanaWallet.id, 'solana') : Promise.resolve([]),
       bitcoinWallet ? getPrivyTransactionsForWallet(bitcoinWallet.id, 'bitcoin') : Promise.resolve([]),
+      getBitcoinActivity(bitcoinAddress ?? bitcoinWallet?.address),
     ]);
 
     debug.checkpoints.push({
@@ -391,18 +397,20 @@ export default async function handler(req, res) {
       baseCount: baseTxs.length,
       solanaCount: solTxs.length,
       bitcoinCount: btcTxs.length,
+      bitcoinChainActivityCount: bitcoinActivity.length,
     });
     logStep('activity:transactions-fetched', {
       baseCount: baseTxs.length,
       solanaCount: solTxs.length,
       bitcoinCount: btcTxs.length,
+      bitcoinChainActivityCount: bitcoinActivity.length,
     });
 
     const items = [
       ...baseTxs.map((tx) => mapPrivyTransaction(tx, 'base')).filter(Boolean),
       ...solTxs.map((tx) => mapPrivyTransaction(tx, 'solana')).filter(Boolean),
       ...btcTxs.map((tx) => mapPrivyTransaction(tx, 'bitcoin')).filter(Boolean),
-      ...getBitcoinActivity(bitcoinAddress ?? bitcoinWallet?.address),
+      ...bitcoinActivity,
     ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
     debug.checkpoints.push({
