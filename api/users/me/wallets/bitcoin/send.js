@@ -55,10 +55,10 @@ function getPrivyBasicAuthHeader() {
 /// native `crypto` module something it can import directly, no extra
 /// crypto library needed.
 function getPrivyAuthorizationPrivateKey() {
-  const raw = env.privyAuthorizationKey;
+  const raw = env.authorizationPrivateKey;
   if (!raw) {
     const error = new Error(
-      'Missing Privy authorization private key (env.privyAuthorizationKey / PRIVY_AUTHORIZATION_KEY)'
+      'Missing Privy authorization private key (env.authorizationPrivateKey / PRIVY_AUTHORIZATION_PRIVATE_KEY)'
     );
     error.status = 500;
     throw error;
