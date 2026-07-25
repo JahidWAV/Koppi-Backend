@@ -1,5 +1,3 @@
-import crypto from 'node:crypto';
-import canonicalize from 'canonicalize';
 import * as btc from '@scure/btc-signer';
 import { OutScript } from '@scure/btc-signer/payment';
 import { getInputType, getPrevOut } from '@scure/btc-signer/transaction';
@@ -43,55 +41,6 @@ function logStep(step, extra = {}) {
 function getPrivyBasicAuthHeader() {
   const credentials = Buffer.from(`${env.appId}:${env.appSecret}`).toString('base64');
   return `Basic ${credentials}`;
-}
-
-/// This wallet has an owner (the "IOS" authorization key), so any action
-/// that mutates or uses it -- raw_sign included -- must carry a
-/// `privy-authorization-signature` header, or Privy rejects it with 401.
-/// See docs.privy.io/api-reference/authorization-signatures.
-///
-/// The stored key material comes in as "wallet-auth:<base64 pkcs8>" --
-/// stripping the prefix and wrapping it in standard PEM armor gives Node's
-/// native `crypto` module something it can import directly, no extra
-/// crypto library needed.
-function getPrivyAuthorizationPrivateKey() {
-  const raw = env.authorizationPrivateKey;
-  if (!raw) {
-    const error = new Error(
-      'Missing Privy authorization private key (env.authorizationPrivateKey / PRIVY_AUTHORIZATION_PRIVATE_KEY)'
-    );
-    error.status = 500;
-    throw error;
-  }
-  const base64Body = raw.replace(/^wallet-auth:/, '');
-  const pem = `-----BEGIN PRIVATE KEY-----\n${base64Body}\n-----END PRIVATE KEY-----`;
-  return crypto.createPrivateKey({ key: pem, format: 'pem' });
-}
-
-/// Builds the `privy-authorization-signature` header value for a POST
-/// request. The payload shape and the RFC 8785 (JCS) canonicalization are
-/// both mandated by Privy -- the signature is over the canonical JSON
-/// string of { version, method, url, body, headers }, where `headers` here
-/// is only the subset of headers Privy tells you to include (privy-app-id,
-/// plus privy-request-expiry if you're sending one), not the full request.
-function buildPrivyAuthorizationSignature({ method, url, body, requestExpiry }) {
-  const headers = { 'privy-app-id': env.appId };
-  if (requestExpiry) headers['privy-request-expiry'] = requestExpiry;
-
-  const payload = { version: 1, method, url, body, headers };
-  const canonical = canonicalize(payload);
-
-  const privateKey = getPrivyAuthorizationPrivateKey();
-
-  // TEMP DIAGNOSTIC — remove once the 401 is resolved. Logs nothing
-  // secret: a public key derived from a private key can't be used to
-  // reconstruct the private key. Compare this against the public key
-  // Privy's Dashboard shows for the "IOS" authorization key.
-  const publicKeyPem = crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'pem' });
-  logStep('DEBUG:derived_public_key', { publicKeyPem, canonical, keyId: env.authorizationKeyId });
-
-  const signature = crypto.sign('sha256', Buffer.from(canonical), privateKey);
-  return signature.toString('base64');
 }
 
 async function verifyAccessToken(req) {
@@ -143,7 +92,14 @@ async function findBitcoinWalletForUser(userId) {
   }
 
   const wallets = Array.isArray(parsed?.data) ? parsed.data : [];
-  return wallets[0] ?? null;
+
+  // Same filter as wallets/bitcoin.js's pickUsableWallet: skip any wallet
+  // with an owner_id set. This user has an old orphaned-owner wallet from
+  // before Bitcoin wallets were made app-controlled -- the backend can
+  // never sign for it, so it must never be selected here.
+  const usable = wallets.filter((w) => !w.owner_id);
+  usable.sort((a, b) => new Date(b.created_at ?? 0) - new Date(a.created_at ?? 0));
+  return usable[0] ?? null;
 }
 
 async function fetchUtxos(address) {
@@ -256,29 +212,14 @@ async function buildUnsignedTransaction({ wallet, toAddress, amountSats }) {
 }
 
 async function rawSignWithPrivy(walletId, hashHex) {
-  const url = `https://api.privy.io/v1/wallets/${walletId}/raw_sign`;
-  const body = { params: { hash: hashHex } };
-  // 60s is plenty for this single outbound call; short-lived on purpose so
-  // a captured/replayed request can't be reused later.
-  const requestExpiry = String(Date.now() + 60_000);
-
-  const authorizationSignature = buildPrivyAuthorizationSignature({
-    method: 'POST',
-    url,
-    body,
-    requestExpiry
-  });
-
-  const response = await fetch(url, {
+  const response = await fetch(`https://api.privy.io/v1/wallets/${walletId}/raw_sign`, {
     method: 'POST',
     headers: {
       Authorization: getPrivyBasicAuthHeader(),
       'Content-Type': 'application/json',
-      'privy-app-id': env.appId,
-      'privy-request-expiry': requestExpiry,
-      'privy-authorization-signature': authorizationSignature
+      'privy-app-id': env.appId
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({ params: { hash: hashHex } })
   });
 
   const responseText = await response.text();
@@ -400,13 +341,6 @@ export default async function handler(req, res) {
       error.status = 404;
       throw error;
     }
-
-    // TEMP DIAGNOSTIC — remove once the 401 is resolved.
-    logStep('DEBUG:wallet_owner', {
-      walletId: wallet.id,
-      ownerId: wallet.owner_id ?? null,
-      envAuthorizationKeyId: env.authorizationKeyId
-    });
 
     const { tx, inputCount, fee, pubkeyBytes } = await buildUnsignedTransaction({
       wallet,
