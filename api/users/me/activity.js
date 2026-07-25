@@ -4,6 +4,90 @@ const PRIVY_ORIGIN = process.env.PRIVY_ORIGIN || 'https://api.koppi.app';
 
 const userCache = new Map();
 
+// Historical USD price cache, keyed by `${coingeckoId}:${dd-mm-yyyy}`. Caches
+// the in-flight Promise (not just the resolved value) so concurrent requests
+// for the same asset/day within a single cold start dedupe onto one fetch.
+const priceCache = new Map();
+
+function coingeckoIdForSymbol(symbol) {
+  switch (String(symbol || '').toLowerCase()) {
+    case 'eth':
+      return 'ethereum';
+    case 'sol':
+      return 'solana';
+    case 'btc':
+      return 'bitcoin';
+    default:
+      return null;
+  }
+}
+
+function formatDateForCoingecko(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = d.getUTCFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+}
+
+// Historical daily USD price for a CoinGecko coin id on the day of
+// `timestamp` (CoinGecko's `/coins/{id}/history` endpoint is daily-
+// granularity only — there's no intraday historical price on the free
+// tier). Returns `null` on any failure so callers can fall back gracefully
+// instead of breaking the whole activity feed over a pricing hiccup.
+function getHistoricalPriceUSD(coingeckoId, timestamp) {
+  const dateStr = formatDateForCoingecko(timestamp);
+  const cacheKey = `${coingeckoId}:${dateStr}`;
+
+  if (priceCache.has(cacheKey)) {
+    return priceCache.get(cacheKey);
+  }
+
+  const promise = (async () => {
+    try {
+      const response = await fetch(
+        `https://api.coingecko.com/api/v3/coins/${coingeckoId}/history?date=${dateStr}&localization=false`,
+        { headers: { Accept: 'application/json' } }
+      );
+      if (!response.ok) return null;
+      const data = await response.json();
+      const price = data?.market_data?.current_price?.usd;
+      return typeof price === 'number' && Number.isFinite(price) ? price : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  priceCache.set(cacheKey, promise);
+  return promise;
+}
+
+// Attaches `fiatText` (signed, e.g. "+$0.96" / "-$0.04") to each item based
+// on the USD price on the day the transaction happened, using each item's
+// internal `_assetSymbol`/`_rawAmount` (stripped before the response is
+// sent). Falls back to `fiatText: null` for anything we can't price.
+async function enrichWithFiat(items) {
+  return Promise.all(
+    items.map(async (item) => {
+      const { _assetSymbol, _rawAmount, ...rest } = item;
+      const coingeckoId = coingeckoIdForSymbol(_assetSymbol);
+
+      if (!coingeckoId || !(_rawAmount > 0)) {
+        return { ...rest, fiatText: null };
+      }
+
+      const price = await getHistoricalPriceUSD(coingeckoId, item.timestamp);
+      if (price === null) {
+        return { ...rest, fiatText: null };
+      }
+
+      const fiatValue = _rawAmount * price;
+      const sign = item.direction === 'incoming' ? '+' : item.direction === 'outgoing' ? '-' : '';
+      return { ...rest, fiatText: `${sign}$${fiatValue.toFixed(2)}` };
+    })
+  );
+}
+
 function sendJson(res, status, body) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
@@ -189,6 +273,30 @@ function formatPrivyAmount(detail, chain) {
   return `${sign}${value} ${symbol}`;
 }
 
+// Numeric (unsigned) amount for a Privy transfer, used only for the fiat
+// multiplication in `enrichWithFiat` — never for display, since converting
+// through `Number` can flip very small values into scientific notation
+// (`formatPrivyAmount` keeps the original decimal string for display).
+function numericPrivyAmount(detail, chain) {
+  const key = String(detail.asset || '').toLowerCase();
+  const display =
+    detail.display_values?.[key] ??
+    detail.display_values?.amount ??
+    detail.display_values?.display_amount ??
+    null;
+
+  if (display) {
+    const n = Number(display);
+    if (Number.isFinite(n)) return Math.abs(n);
+  }
+
+  const raw = safeDisplayNumber(detail.raw_value || 0);
+  const decimals = safeDisplayNumber(detail.raw_value_decimals || 0) ?? 0;
+  if (raw === null) return 0;
+
+  return Math.abs(decimals > 0 ? raw / Math.pow(10, decimals) : raw);
+}
+
 function mapPrivyTransaction(tx, chain) {
   if (!tx) return null;
 
@@ -203,10 +311,15 @@ function mapPrivyTransaction(tx, chain) {
   const symbol = symbolForAsset(detail.asset, chain);
   const isIncoming = direction === 'incoming';
 
+  // Per Privy's schema, `sender`/`recipient` are always both present on a
+  // transfer, regardless of direction — the "other side" of the transfer is
+  // the sender when we received it, the recipient when we sent it.
+  const counterpartyAddress = isIncoming ? detail.sender || null : detail.recipient || null;
+
   return {
     id: tx.privy_transaction_id || tx.id || tx.transaction_hash || `${chain}-${tx.created_at}`,
     chain,
-    title: isIncoming ? `Received ${symbol}` : `Sent ${symbol}`,
+    title: isIncoming ? 'Received' : 'Sent',
     subtitle: chain === 'base' ? 'Base' : chain === 'solana' ? 'Solana' : 'Bitcoin',
     amountText: formatPrivyAmount(detail, chain),
     fiatText: null,
@@ -214,6 +327,11 @@ function mapPrivyTransaction(tx, chain) {
     txHash: tx.transaction_hash || null,
     status: tx.status || 'confirmed',
     direction,
+    counterpartyAddress,
+    // Internal-only fields consumed by `enrichWithFiat`, stripped before
+    // the response is sent.
+    _assetSymbol: symbol,
+    _rawAmount: numericPrivyAmount(detail, chain),
   };
 }
 
@@ -232,6 +350,31 @@ function netValueForBitcoinAddress(tx, address) {
     .reduce((sum, input) => sum + ((input.prevout && input.prevout.value) || 0), 0);
 
   return received - spent;
+}
+
+// Best-effort external counterparty for a Bitcoin tx: for an outgoing
+// payment, the first output that isn't back to our own address; for an
+// incoming one, the first input's previous output that isn't ours. Bitcoin
+// transactions can have multiple inputs/outputs (batched payments, change
+// outputs, coin selection), so this is a heuristic — it picks the first
+// external address, not necessarily "the" counterparty for multi-recipient
+// transactions.
+function pickBitcoinCounterpartyAddress(tx, address, direction) {
+  if (direction === 'outgoing') {
+    const vout = (tx.vout || []).find(
+      (out) => out.scriptpubkey_address && out.scriptpubkey_address !== address
+    );
+    return vout?.scriptpubkey_address || null;
+  }
+
+  if (direction === 'incoming') {
+    const vin = (tx.vin || []).find(
+      (input) => input.prevout?.scriptpubkey_address && input.prevout.scriptpubkey_address !== address
+    );
+    return vin?.prevout?.scriptpubkey_address || null;
+  }
+
+  return null;
 }
 
 async function getBitcoinActivity(bitcoinAddress) {
@@ -263,12 +406,7 @@ async function getBitcoinActivity(bitcoinAddress) {
       return {
         id: tx.txid,
         chain: 'bitcoin',
-        title:
-          direction === 'incoming'
-            ? 'Received BTC'
-            : direction === 'outgoing'
-            ? 'Sent BTC'
-            : 'Bitcoin transfer',
+        title: direction === 'incoming' ? 'Received' : direction === 'outgoing' ? 'Sent' : 'Bitcoin transfer',
         subtitle: tx?.status?.confirmed ? 'Bitcoin' : 'Bitcoin · Pending',
         amountText: `${sign}${satoshisToBTCString(Math.abs(net))} BTC`,
         fiatText: null,
@@ -276,6 +414,11 @@ async function getBitcoinActivity(bitcoinAddress) {
         txHash: tx.txid,
         status: tx?.status?.confirmed ? 'confirmed' : 'pending',
         direction,
+        counterpartyAddress: pickBitcoinCounterpartyAddress(tx, bitcoinAddress, direction),
+        // Internal-only fields consumed by `enrichWithFiat`, stripped
+        // before the response is sent.
+        _assetSymbol: 'BTC',
+        _rawAmount: Math.abs(net) / 100000000,
       };
     })
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
@@ -413,12 +556,19 @@ export default async function handler(req, res) {
       bitcoinChainActivityCount: bitcoinActivity.length,
     });
 
-    const items = [
+    const rawItems = [
       ...baseTxs.map((tx) => mapPrivyTransaction(tx, 'base')).filter(Boolean),
       ...solTxs.map((tx) => mapPrivyTransaction(tx, 'solana')).filter(Boolean),
       ...btcTxs.map((tx) => mapPrivyTransaction(tx, 'bitcoin')).filter(Boolean),
       ...bitcoinActivity,
-    ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    ];
+
+    // Attach a signed USD fiat value (priced on the day the transaction
+    // happened) and strip the internal `_assetSymbol`/`_rawAmount` fields
+    // used to compute it.
+    const items = (await enrichWithFiat(rawItems)).sort(
+      (a, b) => new Date(b.timestamp) - new Date(a.timestamp)
+    );
 
     debug.checkpoints.push({
       step: 'items-mapped',
