@@ -107,15 +107,11 @@ async function listBitcoinWalletsForUser(userId) {
 async function createSegwitWallet(userId) {
   logStep('createSegwitWallet:start', { userId });
 
-  // No `owner` set: this wallet is app-controlled (same model as the
-  // EVM/Solana wallets), so the backend can sign for it directly via
-  // raw_sign with just Basic Auth -- no authorization-signature dance.
-  // (An earlier version of this set `owner: { user_id: userId }`, making
-  // the wallet self-custodial; that requires signing from the *user's*
-  // device via the Privy client SDK, which this backend-only flow can't
-  // do, and left at least one wallet permanently unusable from here.)
   const payload = {
-    chain_type: 'bitcoin-segwit'
+    chain_type: 'bitcoin-segwit',
+    owner: {
+      user_id: userId
+    }
   };
 
   logStep('createSegwitWallet:calling_rest_api', payload);
@@ -155,42 +151,35 @@ async function createSegwitWallet(userId) {
   return parsed;
 }
 
-/// Picks a wallet the backend can actually sign for. Prefers wallets with
-/// no `owner_id` (app-controlled, backend can raw_sign directly); among
-/// those, picks the most recently created one. This intentionally skips
-/// over any user-owned or orphaned-owner wallets left over from before
-/// this app switched Bitcoin wallets to the app-controlled model.
-function pickUsableWallet(wallets) {
-  const usable = wallets.filter((w) => !w.owner_id);
-  if (usable.length === 0) return null;
-  usable.sort((a, b) => new Date(b.created_at ?? 0) - new Date(a.created_at ?? 0));
-  return usable[0];
+/// Picks the most recently created wallet. With this route always setting
+/// `owner: { user_id }`, every wallet it creates is self-custodial and
+/// signable client-side via the Privy SDK, so there's no "usable vs.
+/// orphaned" distinction to make anymore -- just prefer the newest one, in
+/// case a user somehow ends up with more than one.
+function pickWallet(wallets) {
+  if (wallets.length === 0) return null;
+  const sorted = [...wallets].sort(
+    (a, b) => new Date(b.created_at ?? 0) - new Date(a.created_at ?? 0)
+  );
+  return sorted[0];
 }
 
 async function fetchOrCreateSegwitWallet(userId) {
   const existingWallets = await listBitcoinWalletsForUser(userId);
 
-  const usableWallet = pickUsableWallet(existingWallets);
+  const wallet = pickWallet(existingWallets);
 
-  if (usableWallet) {
+  if (wallet) {
     logStep('fetchOrCreateSegwitWallet:found_existing_wallet', {
-      walletId: usableWallet?.id ?? null,
-      address: usableWallet?.address ?? null,
-      chainType: usableWallet?.chain_type ?? null
+      walletId: wallet?.id ?? null,
+      address: wallet?.address ?? null,
+      chainType: wallet?.chain_type ?? null
     });
 
-    return usableWallet;
+    return wallet;
   }
 
-  const orphanedCount = existingWallets.filter((w) => w.owner_id).length;
-  if (orphanedCount > 0) {
-    logStep('fetchOrCreateSegwitWallet:ignoring_orphaned_wallets', {
-      orphanedCount,
-      orphanedIds: existingWallets.filter((w) => w.owner_id).map((w) => w.id)
-    });
-  }
-
-  logStep('fetchOrCreateSegwitWallet:no_usable_wallet_creating_new');
+  logStep('fetchOrCreateSegwitWallet:no_existing_wallet');
 
   return await createSegwitWallet(userId);
 }
