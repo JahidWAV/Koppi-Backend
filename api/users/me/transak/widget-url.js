@@ -30,42 +30,25 @@ const CHAIN_TO_TRANSAK_ASSET = {
   bitcoin: { network: undefined, cryptoCurrencyCode: 'BTC' },
 };
 
-// IMPORTANT: Transak allows only ONE valid access-token at a time — minting
-// a new one immediately invalidates whatever token was issued before it
-// (even if unexpired). An in-memory `let cachedAccessToken` therefore does
-// NOT work correctly on Vercel: each serverless instance has its own copy,
-// so two requests landing on different instances can each mint their own
-// token, and the second call silently invalidates the first instance's
-// token underneath it — producing exactly "Invalid or missing access-token"
-// on whatever request uses the now-stale one.
-//
-// Fix: store the token in something ALL instances share — Vercel KV here.
-// `vercel kv` is a managed Redis; add it from the Vercel dashboard
-// (Storage tab) and it wires up KV_REST_API_URL / KV_REST_API_TOKEN env
-// vars automatically. Swap for any other shared store (Upstash Redis, a
-// Postgres row, etc.) if you already have one.
-import { kv } from '@vercel/kv';
-
-const ACCESS_TOKEN_KEY = `transak:${TRANSAK_ENV}:partner-access-token`;
+// NOTE on the in-memory cache below: Transak allows only ONE valid
+// access-token at a time — minting a new one invalidates whatever was
+// issued before it. This `let` only lives in a single serverless
+// instance's memory, so it's fine for manual/staging testing (one warm
+// instance), but NOT safe once multiple instances handle traffic
+// concurrently in production — two instances could each mint their own
+// token and invalidate each other. Before going live, move this to a
+// store all instances share (Vercel KV, Upstash Redis, a DB row, etc.).
+let cachedAccessToken = null; // { token, expiresAt }
 
 async function getPartnerAccessToken() {
   const apiKey = requireEnv('TRANSAK_API_KEY');
   const apiSecret = requireEnv('TRANSAK_API_SECRET');
 
   const now = Math.floor(Date.now() / 1000);
-  const cached = await kv.get(ACCESS_TOKEN_KEY); // { token, expiresAt } | null
-
-  if (cached && cached.expiresAt - 60 > now) {
-    return cached.token;
+  if (cachedAccessToken && cachedAccessToken.expiresAt - 60 > now) {
+    return cachedAccessToken.token;
   }
 
-  // NOTE: a small race is still possible if two instances both see a
-  // stale/missing token at the same instant and both refresh — Transak's
-  // "only one active token" rule means the loser's token then looks
-  // "invalid" on its very next use. That's now rare (one 7-day refresh
-  // instead of one per cold start) rather than routine. If you need it
-  // fully race-proof, wrap this in a KV-based lock (e.g. `kv.set` with
-  // `NX` as a mutex) before calling refresh-token.
   const res = await fetch(`${TRANSAK_AUTH_BASE}/partners/api/v2/refresh-token`, {
     method: 'POST',
     headers: {
@@ -82,9 +65,8 @@ async function getPartnerAccessToken() {
   }
 
   const { data } = JSON.parse(bodyText);
-  const record = { token: data.accessToken, expiresAt: data.expiresAt };
-  await kv.set(ACCESS_TOKEN_KEY, record);
-  return record.token;
+  cachedAccessToken = { token: data.accessToken, expiresAt: data.expiresAt };
+  return cachedAccessToken.token;
 }
 
 function requireEnv(name) {
