@@ -82,6 +82,14 @@ function buildPrivyAuthorizationSignature({ method, url, body, requestExpiry }) 
   const canonical = canonicalize(payload);
 
   const privateKey = getPrivyAuthorizationPrivateKey();
+
+  // TEMP DIAGNOSTIC — remove once the 401 is resolved. Logs nothing
+  // secret: a public key derived from a private key can't be used to
+  // reconstruct the private key. Compare this against the public key
+  // Privy's Dashboard shows for the "IOS" authorization key.
+  const publicKeyPem = crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'pem' });
+  logStep('DEBUG:derived_public_key', { publicKeyPem, canonical, keyId: env.authorizationKeyId });
+
   const signature = crypto.sign('sha256', Buffer.from(canonical), privateKey);
   return signature.toString('base64');
 }
@@ -392,6 +400,13 @@ export default async function handler(req, res) {
       error.status = 404;
       throw error;
     }
+
+    // TEMP DIAGNOSTIC — remove once the 401 is resolved.
+    logStep('DEBUG:wallet_owner', {
+      walletId: wallet.id,
+      ownerId: wallet.owner_id ?? null,
+      envAuthorizationKeyId: env.authorizationKeyId
+    });
 
     const { tx, inputCount, fee, pubkeyBytes } = await buildUnsignedTransaction({
       wallet,
