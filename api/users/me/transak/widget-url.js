@@ -1,19 +1,18 @@
-/**
- * Reference implementation for POST /api/users/me/transak/widget-url
- *
- * This is the backend counterpart to iOS's `TransakWidgetService`. It's
- * written as plain Node/Express so the logic is easy to port to whatever
- * framework api.koppi.app actually runs (Fastify, Next.js API routes,
- * Django, Rails, etc.) — the important part is the two outbound calls to
- * Transak and the constraints called out inline, not the framework.
- *
- * Why this has to live on the backend at all: Transak deprecated building
- * the widget URL client-side. The new flow requires a Partner Access Token
- * that must stay server-side, and Transak's Create Widget URL API flatly
- * rejects calls that don't come from a whitelisted partner backend IP:
- *   https://docs.transak.com/guides/migration-to-api-based-transak-widget-url
- *   https://docs.transak.com/api/public/create-widget-url
- */
+// pages/api/users/me/transak/widget-url.js
+//
+// Next.js Pages Router API route. Key differences from the earlier
+// Express-style reference:
+//   - MUST be a default export — Next.js invokes `export default`, not a
+//     named export. This alone is likely why you got
+//     FUNCTION_INVOCATION_FAILED: with only `module.exports = { ... }`,
+//     Next had no handler to actually call.
+//   - req.body is already parsed JSON here (Pages Router does this for
+//     you) — no need for anything extra as long as the client sends
+//     Content-Type: application/json, which TransakWidgetService.swift does.
+//   - The whole handler is wrapped in one top-level try/catch so ANY
+//     unexpected error (missing env var, etc.) still comes back as JSON
+//     with a real message instead of Vercel's generic crash page — that
+//     alone will turn your next failed test into something you can act on.
 
 const TRANSAK_API_BASE = process.env.TRANSAK_ENV === 'staging'
   ? 'https://api-gateway-stg.transak.com'
@@ -23,27 +22,18 @@ const TRANSAK_AUTH_BASE = process.env.TRANSAK_ENV === 'staging'
   ? 'https://api-stg.transak.com'
   : 'https://api.transak.com';
 
-const TRANSAK_API_KEY = process.env.TRANSAK_API_KEY;       // Partner API key (dashboard)
-const TRANSAK_API_SECRET = process.env.TRANSAK_API_SECRET; // Partner API secret (dashboard) — NEVER ship this in the app
-
-// Maps this app's chain identifiers to Transak's network / cryptoCurrencyCode.
-// (Mirrors the mapping that used to live in Transakbuyview.swift.)
 const CHAIN_TO_TRANSAK_ASSET = {
   evm: { network: 'base', cryptoCurrencyCode: 'ETH' },
   solana: { network: 'solana', cryptoCurrencyCode: 'SOL' },
   bitcoin: { network: undefined, cryptoCurrencyCode: 'BTC' },
 };
 
-/**
- * Partner Access Token cache. Transak's docs explicitly warn against
- * calling Refresh Access Token on every request — the token is valid for
- * 7 days, so cache it (in memory here; use Redis/similar for a
- * multi-instance deployment so instances share one token and don't each
- * mint their own).
- */
-let cachedAccessToken = null; // { token, expiresAt } — expiresAt in epoch seconds
+let cachedAccessToken = null; // { token, expiresAt } — in-memory; fine for a single Vercel region/instance, but note each cold start starts empty
 
 async function getPartnerAccessToken() {
+  const apiKey = requireEnv('TRANSAK_API_KEY');
+  const apiSecret = requireEnv('TRANSAK_API_SECRET');
+
   const now = Math.floor(Date.now() / 1000);
   if (cachedAccessToken && cachedAccessToken.expiresAt - 60 > now) {
     return cachedAccessToken.token;
@@ -52,58 +42,77 @@ async function getPartnerAccessToken() {
   const res = await fetch(`${TRANSAK_AUTH_BASE}/partners/api/v2/refresh-token`, {
     method: 'POST',
     headers: {
-      'api-secret': TRANSAK_API_SECRET,
-      'x-api-key': TRANSAK_API_KEY,
+      'api-secret': apiSecret,
+      'x-api-key': apiKey,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ apiKey: TRANSAK_API_KEY }),
+    body: JSON.stringify({ apiKey }),
   });
 
+  const bodyText = await res.text();
   if (!res.ok) {
-    throw new Error(`Transak refresh-token failed: ${res.status}`);
+    throw new Error(`Transak refresh-token failed (${res.status}): ${bodyText}`);
   }
 
-  const { data } = await res.json();
+  const { data } = JSON.parse(bodyText);
   cachedAccessToken = { token: data.accessToken, expiresAt: data.expiresAt };
   return cachedAccessToken.token;
 }
 
-/**
- * POST /api/users/me/transak/widget-url
- * Auth: same Bearer(Privy access token) middleware as the balances/activity
- * routes — reuse it here too, don't skip auth just because this is a
- * "just get a URL" endpoint.
- *
- * Body: { chain: "evm" | "solana" | "bitcoin", walletAddress: string }
- * Response: { widgetUrl: string }
- */
-async function createTransakWidgetUrlHandler(req, res) {
-  const { chain, walletAddress } = req.body || {};
-  const asset = CHAIN_TO_TRANSAK_ASSET[chain];
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    // This is almost certainly your actual crash if env vars aren't set
+    // in the Vercel project settings for this environment (Production /
+    // Preview / Development each have their own!).
+    throw new Error(`Missing required env var: ${name}`);
+  }
+  return value;
+}
 
-  if (!asset || !walletAddress) {
-    return res.status(400).json({ error: 'Missing or invalid chain/walletAddress.' });
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).json({ error: 'Method not allowed.' });
   }
 
   try {
-    const accessToken = await getPartnerAccessToken();
+    // TODO: replace with your real Privy-token verification (same
+    // middleware/logic used by your balances/activity routes). Left
+    // explicit here rather than assumed, since a throw inside auth
+    // verification with no try/catch was one of the two likely causes of
+    // the crash you hit.
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Missing bearer token.' });
+    }
+    // const privyUser = await verifyPrivyToken(authHeader.slice(7));
 
-    // Required per Transak's mandatory security changes — the end user's
-    // real originating IP, not this server's IP. Adjust the extraction to
-    // match your actual proxy setup (e.g. the first hop in X-Forwarded-For,
-    // or req.ip if you've configured Express's `trust proxy` correctly).
-    const userIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip;
+    const { chain, walletAddress } = req.body || {};
+    const asset = CHAIN_TO_TRANSAK_ASSET[chain];
+
+    if (!asset || !walletAddress) {
+      return res.status(400).json({ error: 'Missing or invalid chain/walletAddress.' });
+    }
+
+    const accessToken = await getPartnerAccessToken();
+    const apiKey = requireEnv('TRANSAK_API_KEY');
+
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const userIp = (Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor || '')
+      .split(',')[0]
+      .trim() || req.socket?.remoteAddress || '';
 
     const widgetParams = {
-      apiKey: TRANSAK_API_KEY,
-      referrerDomain: 'api.koppi.app', // must match what's registered in the Transak dashboard
+      apiKey,
+      referrerDomain: 'api.koppi.app',
       productsAvailed: 'BUY',
       walletAddress,
       disableWalletAddressForm: true,
       cryptoCurrencyCode: asset.cryptoCurrencyCode,
       themeColor: '000000',
       colorMode: 'LIGHT',
-      redirectURL: 'https://api.koppi.app/transak-return', // must match TransakConfig.redirectURL in the app
+      redirectURL: 'https://api.koppi.app/transak-return',
     };
     if (asset.network) {
       widgetParams.network = asset.network;
@@ -113,27 +122,25 @@ async function createTransakWidgetUrlHandler(req, res) {
       method: 'POST',
       headers: {
         'access-token': accessToken,
-        'x-api-key': TRANSAK_API_KEY,
+        'x-api-key': apiKey,
         'x-user-ip': userIp,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ widgetParams }),
     });
 
+    const sessionBodyText = await sessionRes.text();
     if (!sessionRes.ok) {
-      const errBody = await sessionRes.text();
-      console.error('Transak create-widget-url failed:', sessionRes.status, errBody);
-      return res.status(502).json({ error: 'Could not start the Transak session.' });
+      console.error('Transak create-widget-url failed:', sessionRes.status, sessionBodyText);
+      return res.status(502).json({ error: `Transak session creation failed (${sessionRes.status}).` });
     }
 
-    const { data } = await sessionRes.json();
-    // NOTE: data.widgetUrl expires in 5 minutes and is single-use — return
-    // it as-is and don't cache it server-side either.
+    const { data } = JSON.parse(sessionBodyText);
     return res.status(200).json({ widgetUrl: data.widgetUrl });
   } catch (error) {
-    console.error('createTransakWidgetUrlHandler error:', error);
-    return res.status(500).json({ error: 'Unexpected error creating the Transak session.' });
+    // This is the important part: no matter what breaks above, the
+    // response is always JSON, never Vercel's generic crash page.
+    console.error('transak/widget-url crashed:', error);
+    return res.status(500).json({ error: error.message || 'Unexpected server error.' });
   }
 }
-
-module.exports = { createTransakWidgetUrlHandler };
