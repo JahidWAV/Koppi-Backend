@@ -1,4 +1,8 @@
 import * as btc from '@scure/btc-signer';
+import { OutScript } from '@scure/btc-signer/payment';
+import { getInputType, getPrevOut } from '@scure/btc-signer/transaction';
+import { concatBytes } from '@scure/btc-signer/utils';
+import secp256k1 from 'secp256k1';
 import { hex } from '@scure/base';
 import {
   getBearerToken,
@@ -151,7 +155,10 @@ function selectUtxos(utxos, amountSats, feeRateSatsPerVByte) {
   throw error;
 }
 
-async function buildUnsignedPsbt({ wallet, toAddress, amountSats }) {
+/// Builds the unsigned Transaction object (kept in memory, not round-
+/// tripped through a PSBT — Privy signs each input's hash directly via
+/// raw_sign, so there's no need to hand the PSBT to anything external).
+async function buildUnsignedTransaction({ wallet, toAddress, amountSats }) {
   const pubkeyBytes = hex.decode(wallet.public_key);
   const ownScript = btc.p2wpkh(pubkeyBytes, NETWORK);
 
@@ -194,26 +201,22 @@ async function buildUnsignedPsbt({ wallet, toAddress, amountSats }) {
     tx.addOutputAddress(wallet.address, change, NETWORK);
   }
 
-  return { psbtHex: hex.encode(tx.toPSBT()), inputCount: selected.length, fee };
+  return { tx, inputCount: selected.length, fee, pubkeyBytes };
 }
 
-async function signWithPrivy(walletId, psbtHex) {
-  const response = await fetch(`https://api.privy.io/v1/wallets/${walletId}/rpc`, {
+async function rawSignWithPrivy(walletId, hashHex) {
+  const response = await fetch(`https://api.privy.io/v1/wallets/${walletId}/raw_sign`, {
     method: 'POST',
     headers: {
       Authorization: getPrivyBasicAuthHeader(),
       'Content-Type': 'application/json',
       'privy-app-id': env.appId
     },
-    body: JSON.stringify({
-      method: 'signTransaction',
-      chain_type: 'bitcoin-segwit',
-      params: { psbt: psbtHex }
-    })
+    body: JSON.stringify({ params: { hash: hashHex } })
   });
 
   const responseText = await response.text();
-  logStep('signWithPrivy:rest_response', { status: response.status, ok: response.ok });
+  logStep('rawSignWithPrivy:rest_response', { status: response.status, ok: response.ok });
 
   let parsed;
   try {
@@ -223,21 +226,64 @@ async function signWithPrivy(walletId, psbtHex) {
   }
 
   if (!response.ok) {
-    const error = new Error(`Privy signTransaction failed with status ${response.status}`);
+    const error = new Error(`Privy raw_sign failed with status ${response.status}`);
     error.status = response.status;
     error.response = parsed;
     throw error;
   }
 
-  const signedTransaction = parsed?.data?.signedTransaction;
-  if (!signedTransaction) {
-    const error = new Error('Privy response did not include a signedTransaction');
+  const signature = parsed?.data?.signature;
+  if (!signature) {
+    const error = new Error('Privy raw_sign response did not include a signature');
     error.status = 502;
     error.response = parsed;
     throw error;
   }
 
-  return signedTransaction;
+  return signature;
+}
+
+/// Signs every input of `tx` via Privy's raw_sign endpoint, one at a time.
+/// This is the Bitcoin-segwit equivalent of what `signTransaction` does in
+/// one call for Solana: Privy has no whole-PSBT signing route for Bitcoin
+/// at the REST level, only per-input raw hash signing (see
+/// docs.privy.io/wallets/using-wallets/bitcoin/sign-transaction-inputs).
+/// For a P2WPKH input, BIP143's sighash preimage uses the *legacy* P2PKH
+/// script as its "scriptCode" (not the P2WPKH script itself) -- that's
+/// what the wpkh -> pkh OutScript conversion below is for.
+async function signAllInputsWithPrivy(tx, walletId, pubkeyBuffer) {
+  for (let i = 0; i < tx.inputsLength; i++) {
+    const input = tx.getInput(i);
+    const inputType = getInputType(input, tx.opts.allowLegacyWitnessUtxo);
+    const prevOut = getPrevOut(input);
+
+    let script = inputType.lastScript;
+    if (inputType.last.type === 'wpkh') {
+      script = OutScript.encode({ type: 'pkh', hash: inputType.last.hash });
+    }
+
+    const sighash = tx.preimageWitnessV0(i, script, inputType.sighash, prevOut.amount);
+
+    const signatureHex = await rawSignWithPrivy(walletId, `0x${hex.encode(sighash)}`);
+    const signatureBytes = Buffer.from(signatureHex.replace(/^0x/, ''), 'hex');
+    // Privy's raw_sign is documented to return a hex signature but doesn't
+    // pin down compact vs. DER encoding. A raw secp256k1 ECDSA signature
+    // is always exactly 64 bytes (r || s); anything else is assumed to be
+    // DER and gets parsed down to that same 64-byte compact form, which is
+    // what partialSig expects here (@scure/btc-signer DER-encodes it
+    // internally at finalize time).
+    const compactSig = signatureBytes.length === 64
+      ? signatureBytes
+      : secp256k1.signatureImport(signatureBytes);
+
+    tx.updateInput(
+      i,
+      {
+        partialSig: [[pubkeyBuffer, concatBytes(compactSig, new Uint8Array([inputType.sighash]))]]
+      },
+      true
+    );
+  }
 }
 
 async function broadcastRawTransaction(rawTxHex) {
@@ -289,15 +335,23 @@ export default async function handler(req, res) {
       throw error;
     }
 
-    const { psbtHex, inputCount, fee } = await buildUnsignedPsbt({
+    const { tx, inputCount, fee, pubkeyBytes } = await buildUnsignedTransaction({
       wallet,
       toAddress: toAddress.trim(),
       amountSats: amount
     });
 
-    logStep('handler:psbt_built', { userId, inputCount, fee: fee.toString() });
+    logStep('handler:transaction_built', { userId, inputCount, fee: fee.toString() });
 
-    const signedTxHex = await signWithPrivy(wallet.id, psbtHex);
+    await signAllInputsWithPrivy(tx, wallet.id, Buffer.from(pubkeyBytes));
+
+    // finalize() re-validates every signature against its input script and
+    // throws if any of them don't actually verify -- our safety net in
+    // case the raw_sign signature format ever doesn't line up with what
+    // partialSig expects.
+    tx.finalize();
+
+    const signedTxHex = tx.hex;
     const txId = await broadcastRawTransaction(signedTxHex);
 
     logStep('handler:success', { userId, txId });
