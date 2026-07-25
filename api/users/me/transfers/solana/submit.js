@@ -206,10 +206,43 @@ export default async function handler(req, res) {
     const rawTransaction = buildSignedTransaction(messageBytes, signatureBytes);
     const rawTransactionBase64 = Buffer.from(rawTransaction).toString('base64');
 
-    const txId = await solanaRpc('sendTransaction', [
-      rawTransactionBase64,
-      { encoding: 'base64', skipPreflight: false, maxRetries: 3 }
-    ]);
+    // skipPreflight: true is deliberate here. With the public RPC endpoint
+    // (or any load-balanced provider), the node that handles this
+    // `sendTransaction` call isn't guaranteed to be the same one that
+    // served `getLatestBlockhash` in prepare.js -- if it's lagged by even
+    // one slot, its local preflight simulation rejects an otherwise-valid,
+    // not-actually-expired blockhash with "BlockhashNotFound". Skipping
+    // preflight forwards the transaction straight to the leader, which is
+    // the node that actually decides validity. One short retry covers the
+    // same lag if it shows up at the broadcast step instead.
+    let txId;
+    try {
+      txId = await solanaRpc('sendTransaction', [
+        rawTransactionBase64,
+        { encoding: 'base64', skipPreflight: true, maxRetries: 3 }
+      ]);
+    } catch (sendError) {
+      const isBlockhashNotFound = sendError?.response?.data?.err === 'BlockhashNotFound';
+      if (!isBlockhashNotFound) {
+        throw sendError;
+      }
+      logStep('handler:retrying_after_blockhash_not_found', { userId });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      try {
+        txId = await solanaRpc('sendTransaction', [
+          rawTransactionBase64,
+          { encoding: 'base64', skipPreflight: true, maxRetries: 3 }
+        ]);
+      } catch (retryError) {
+        const stillBlockhashNotFound = retryError?.response?.data?.err === 'BlockhashNotFound';
+        if (stillBlockhashNotFound) {
+          const error = new Error('This transfer took too long to sign and its blockhash expired — please try again.');
+          error.status = 409;
+          throw error;
+        }
+        throw retryError;
+      }
+    }
 
     logStep('handler:broadcast_success', { userId, txId });
 
