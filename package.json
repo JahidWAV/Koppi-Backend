@@ -9,6 +9,7 @@
     "@privy-io/node": "^0.24.0",
     "@scure/base": "^1.1.9",
     "@scure/btc-signer": "^1.4.0",
+    "canonicalize": "^2.0.0",
     "jose": "^5.9.6",
     "secp256k1": "^5.0.1"
   }
