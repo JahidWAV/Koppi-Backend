@@ -187,12 +187,17 @@ function buildTransferMessage({ fromBytes, toBytes, lamports, blockhashBytes }) 
   return concatBytes(header, accountKeysSection, blockhashBytes, instructionsSection);
 }
 
+// Expiration is 60s, not the 5 minutes this used to be -- a Solana
+// blockhash is itself only valid for ~60-90 seconds (150 slots), so a
+// longer JWT expiry just let a stale-blockhash transfer sit around long
+// enough to fail later with a confusing on-chain "BlockhashNotFound"
+// instead of a clear "please retry" from /submit's own JWT check.
 async function signTransferToken(payload) {
   const secret = new TextEncoder().encode(env.appSecret);
   return await new SignJWT(payload)
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
-    .setExpirationTime('5m')
+    .setExpirationTime('60s')
     .sign(secret);
 }
 
