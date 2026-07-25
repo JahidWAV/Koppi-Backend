@@ -9,10 +9,6 @@
     "@privy-io/node": "^0.24.0",
     "@scure/base": "^1.1.9",
     "@scure/btc-signer": "^1.4.0",
-    "@solana/web3.js": "^1.95.3",
     "jose": "^5.9.6"
-  },
-  "overrides": {
-    "rpc-websockets": "7.5.1"
   }
 }
