@@ -4,7 +4,6 @@ import { getBearerToken, verifyPrivyAccessToken } from '../../../lib/privy.js';
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
 const PRIVY_BASE_URL = 'https://api.privy.io';
-const ESPLORA_BASE_URL = 'https://blockstream.info/api';
 
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing required env var: ${name}`);
@@ -123,41 +122,6 @@ async function fetchWalletBalance(walletId, asset, chain) {
   );
 }
 
-async function fetchBitcoinBalance(address) {
-  const fundedJson = await fetchJson(
-    `${ESPLORA_BASE_URL}/address/${address}`,
-    { method: 'GET', headers: { Accept: 'application/json' } },
-    'Esplora address'
-  );
-
-  const funded = fundedJson.chain_stats?.funded_txo_sum || 0;
-  const spent = fundedJson.chain_stats?.spent_txo_sum || 0;
-  const sats = funded - spent;
-  const btcAmount = sats / 100000000;
-
-  const priceJson = await fetchJson(
-    'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
-    { method: 'GET', headers: { Accept: 'application/json' } },
-    'CoinGecko BTC price'
-  );
-
-  const btcUsd = Number(priceJson?.bitcoin?.usd || 0);
-
-  return {
-    network: 'bitcoin',
-    networkDisplayName: 'Bitcoin',
-    symbol: 'BTC',
-    name: 'Bitcoin',
-    amount: btcAmount.toString(),
-    fiatValue: (btcAmount * btcUsd).toFixed(2),
-    isNative: true,
-    contractAddress: null,
-  };
-}
-
-// Réseaux EVM supportés — chacun devient un WalletAsset distinct dans le
-// tableau `evm`, même s'ils partagent le même symbole (ETH sur Ethereum
-// *et* sur Base sont deux assets séparés, avec des soldes différents).
 const EVM_NETWORKS = [
   { network: 'ethereum', networkDisplayName: 'Ethereum', asset: 'eth', symbol: 'ETH', name: 'Ethereum' },
   { network: 'base', networkDisplayName: 'Base', asset: 'eth', symbol: 'ETH', name: 'Ethereum' },
@@ -201,7 +165,7 @@ export default async function handler(req, res) {
       return res.status(401).json({ ok: false, error: 'Missing Privy user id in token claims' });
     }
 
-    const { evmAddress, solanaAddress, bitcoinAddress } = req.query;
+    const { evmAddress, solanaAddress } = req.query;
 
     const userPayload = await fetchPrivyUserById(userId);
     const wallets = extractWalletsFromUserResponse(userPayload);
@@ -209,26 +173,18 @@ export default async function handler(req, res) {
     const evmWalletId = findWalletIdByAddress(wallets, evmAddress, 'ethereum');
     const solanaWalletId = findWalletIdByAddress(wallets, solanaAddress, 'solana');
 
-    const [evmResponse, solanaResponse, bitcoinAsset] = await Promise.all([
+    const [evmResponse, solanaResponse] = await Promise.all([
       evmWalletId
         ? fetchWalletBalance(evmWalletId, ['eth', 'pol'], ['ethereum', 'base', 'arbitrum', 'polygon'])
         : Promise.resolve({ balances: [] }),
       solanaWalletId
         ? fetchWalletBalance(solanaWalletId, 'sol', 'solana')
         : Promise.resolve({ balances: [] }),
-      bitcoinAddress
-        ? fetchBitcoinBalance(bitcoinAddress).catch((error) => {
-            console.error('fetchBitcoinBalance failed', error);
-            return null;
-          })
-        : Promise.resolve(null),
     ]);
 
     const evmEntries = evmResponse.balances || evmResponse.data?.balances || [];
     const solEntries = solanaResponse.balances || solanaResponse.data?.balances || [];
 
-    // evm: un WalletAsset par réseau EVM supporté (tableau, pas objet
-    // agrégé) — c'est ce que décode `BalanceService.swift`.
     const evmAssets = EVM_NETWORKS.map((meta) => buildAssetFromEntries(evmEntries, meta));
 
     const solanaAssets = [
@@ -246,10 +202,6 @@ export default async function handler(req, res) {
       balances: {
         evm: evmAssets,
         solana: solanaAssets,
-        // NOTE: le modèle Swift `WalletBalances` n'a pas encore de champ
-        // `bitcoinAssets` — cette clé est ignorée côté client tant que tu
-        // n'ajoutes pas ce champ dans BalanceService.swift.
-        bitcoin: bitcoinAsset ? [bitcoinAsset] : [],
       },
       resolvedWallets: {
         evmWalletId,
