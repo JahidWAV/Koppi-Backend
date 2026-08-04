@@ -54,7 +54,6 @@ async function fetchPrivyUserById(userId) {
 
 function extractWalletsFromUserResponse(payload) {
   const user = payload?.data ?? payload?.user ?? payload;
-
   const linkedAccounts = user?.linked_accounts ?? user?.linkedAccounts ?? [];
   const wallets = [];
 
@@ -73,12 +72,7 @@ function extractWalletsFromUserResponse(payload) {
       String(type || '').includes('wallet');
 
     if (isWalletLike && address) {
-      wallets.push({
-        id,
-        address,
-        chainType,
-        type,
-      });
+      wallets.push({ id, address, chainType, type });
     }
   }
 
@@ -87,7 +81,6 @@ function extractWalletsFromUserResponse(payload) {
 
 function findWalletIdByAddress(wallets, address, expectedChainType) {
   if (!address) return null;
-
   const normalizedAddress = String(address).toLowerCase();
 
   const exactChainMatch = wallets.find(
@@ -96,13 +89,11 @@ function findWalletIdByAddress(wallets, address, expectedChainType) {
       (!expectedChainType ||
         String(wallet.chainType || '').toLowerCase() === expectedChainType.toLowerCase())
   );
-
   if (exactChainMatch?.id) return exactChainMatch.id;
 
   const fallbackMatch = wallets.find(
     (wallet) => wallet.address?.toLowerCase() === normalizedAddress
   );
-
   return fallbackMatch?.id ?? null;
 }
 
@@ -153,43 +144,50 @@ async function fetchBitcoinBalance(address) {
   const btcUsd = Number(priceJson?.bitcoin?.usd || 0);
 
   return {
+    network: 'bitcoin',
+    networkDisplayName: 'Bitcoin',
     symbol: 'BTC',
+    name: 'Bitcoin',
     amount: btcAmount.toString(),
     fiatValue: (btcAmount * btcUsd).toFixed(2),
+    isNative: true,
+    contractAddress: null,
   };
 }
 
-function normalizeEntry(entries, chain, assetKey, symbol) {
+// Réseaux EVM supportés — chacun devient un WalletAsset distinct dans le
+// tableau `evm`, même s'ils partagent le même symbole (ETH sur Ethereum
+// *et* sur Base sont deux assets séparés, avec des soldes différents).
+const EVM_NETWORKS = [
+  { network: 'ethereum', networkDisplayName: 'Ethereum', asset: 'eth', symbol: 'ETH', name: 'Ethereum' },
+  { network: 'base', networkDisplayName: 'Base', asset: 'eth', symbol: 'ETH', name: 'Ethereum' },
+  { network: 'arbitrum', networkDisplayName: 'Arbitrum', asset: 'eth', symbol: 'ETH', name: 'Ethereum' },
+  { network: 'polygon', networkDisplayName: 'Polygon', asset: 'pol', symbol: 'POL', name: 'Polygon' },
+];
+
+function buildAssetFromEntries(entries, meta) {
   const match = (entries || []).find(
     (item) =>
-      String(item.chain || '').toLowerCase() === chain.toLowerCase() &&
-      String(item.asset || '').toLowerCase() === assetKey.toLowerCase()
+      String(item.chain || '').toLowerCase() === meta.network.toLowerCase() &&
+      String(item.asset || '').toLowerCase() === meta.asset.toLowerCase()
   );
 
   return {
-    symbol,
-    amount: match?.display_values?.[assetKey] || '0',
+    network: meta.network,
+    networkDisplayName: meta.networkDisplayName,
+    symbol: meta.symbol,
+    name: meta.name,
+    amount: match?.display_values?.[meta.asset] || '0',
     fiatValue: match?.display_values?.usd || '0',
+    isNative: true,
+    contractAddress: null,
   };
-}
-
-function sumFiat(...values) {
-  return values
-    .map((v) => Number(v || '0'))
-    .filter((v) => Number.isFinite(v))
-    .reduce((sum, value) => sum + value, 0);
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
-
-  console.log('balances route invoked', {
-    method: req.method,
-    url: req.url,
-    query: req.query,
-  });
 
   try {
     const token = getBearerToken(req);
@@ -199,7 +197,6 @@ export default async function handler(req, res) {
 
     const claims = await verifyPrivyAccessToken(token);
     const userId = claims?.sub || claims?.userId || claims?.user_id;
-
     if (!userId) {
       return res.status(401).json({ ok: false, error: 'Missing Privy user id in token claims' });
     }
@@ -212,71 +209,47 @@ export default async function handler(req, res) {
     const evmWalletId = findWalletIdByAddress(wallets, evmAddress, 'ethereum');
     const solanaWalletId = findWalletIdByAddress(wallets, solanaAddress, 'solana');
 
-    console.log('resolved wallet ids', {
-      userId,
-      evmAddress,
-      evmWalletId,
-      solanaAddress,
-      solanaWalletId,
-      bitcoinAddress,
-      walletCount: wallets.length,
-    });
-
-    const [evmResponse, solanaResponse, bitcoin] = await Promise.all([
+    const [evmResponse, solanaResponse, bitcoinAsset] = await Promise.all([
       evmWalletId
-        ? fetchWalletBalance(
-            evmWalletId,
-            ['eth', 'pol'],
-            ['ethereum', 'base', 'arbitrum', 'polygon']
-          )
+        ? fetchWalletBalance(evmWalletId, ['eth', 'pol'], ['ethereum', 'base', 'arbitrum', 'polygon'])
         : Promise.resolve({ balances: [] }),
       solanaWalletId
         ? fetchWalletBalance(solanaWalletId, 'sol', 'solana')
         : Promise.resolve({ balances: [] }),
       bitcoinAddress
-        ? fetchBitcoinBalance(bitcoinAddress)
-        : Promise.resolve({ symbol: 'BTC', amount: '0', fiatValue: '0' }),
+        ? fetchBitcoinBalance(bitcoinAddress).catch((error) => {
+            console.error('fetchBitcoinBalance failed', error);
+            return null;
+          })
+        : Promise.resolve(null),
     ]);
 
     const evmEntries = evmResponse.balances || evmResponse.data?.balances || [];
     const solEntries = solanaResponse.balances || solanaResponse.data?.balances || [];
 
-    const ethereum = normalizeEntry(evmEntries, 'ethereum', 'eth', 'ETH');
-    const base = normalizeEntry(evmEntries, 'base', 'eth', 'ETH');
-    const arbitrum = normalizeEntry(evmEntries, 'arbitrum', 'eth', 'ETH');
-    const polygon = normalizeEntry(evmEntries, 'polygon', 'pol', 'POL');
-    const solana = normalizeEntry(solEntries, 'solana', 'sol', 'SOL');
+    // evm: un WalletAsset par réseau EVM supporté (tableau, pas objet
+    // agrégé) — c'est ce que décode `BalanceService.swift`.
+    const evmAssets = EVM_NETWORKS.map((meta) => buildAssetFromEntries(evmEntries, meta));
 
-    const evmTotalAmount =
-      (Number(ethereum.amount || '0') || 0) +
-      (Number(base.amount || '0') || 0) +
-      (Number(arbitrum.amount || '0') || 0) +
-      (Number(polygon.amount || '0') || 0);
-
-    const evmTotalFiat = sumFiat(
-      ethereum.fiatValue,
-      base.fiatValue,
-      arbitrum.fiatValue,
-      polygon.fiatValue
-    );
+    const solanaAssets = [
+      buildAssetFromEntries(solEntries, {
+        network: 'solana',
+        networkDisplayName: 'Solana',
+        asset: 'sol',
+        symbol: 'SOL',
+        name: 'Solana',
+      }),
+    ];
 
     return res.status(200).json({
       ok: true,
       balances: {
-        evm: {
-          symbol: 'EVM',
-          amount: String(evmTotalAmount),
-          fiatValue: evmTotalFiat.toFixed(2),
-        },
-        solana,
-        bitcoin,
-      },
-      networks: {
-        ethereum,
-        base,
-        arbitrum,
-        polygon,
-        solana,
+        evm: evmAssets,
+        solana: solanaAssets,
+        // NOTE: le modèle Swift `WalletBalances` n'a pas encore de champ
+        // `bitcoinAssets` — cette clé est ignorée côté client tant que tu
+        // n'ajoutes pas ce champ dans BalanceService.swift.
+        bitcoin: bitcoinAsset ? [bitcoinAsset] : [],
       },
       resolvedWallets: {
         evmWalletId,
